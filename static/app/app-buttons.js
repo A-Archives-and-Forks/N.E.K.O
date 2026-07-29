@@ -2154,6 +2154,20 @@
                     S.sessionStartedResolver = resolve;
                     S.sessionStartedRejecter = reject;
                     S._pendingSessionStartMode = 'audio';
+                    // Re-arm the fail-closed voice latch on user intent, strictly
+                    // before start_session goes out and therefore before any route
+                    // verdict for this session can arrive.
+                    //
+                    // This assignment was MISSING while the comment describing it
+                    // was not: the automatic-restart path in app-websocket.js has
+                    // it, this one did not, so a latch set by one failed session
+                    // survived into the next explicit attempt and the mic refused
+                    // with nothing on screen to explain it. Restoring it is safe
+                    // now that session_started carries `microphone_route`: if the
+                    // route really is still blocked, the ack re-sets the latch
+                    // before the promise settles, so clearing it here can no
+                    // longer open the mic onto a dead route.
+                    S.voiceInputRouteBlocked = false;
 
                     if (window.sessionTimeoutId) {
                         clearTimeout(window.sessionTimeoutId);
@@ -2203,6 +2217,36 @@
                     // 之后才 settle、把 UI 写回录音中"的竞态，也就不需要 token / 补充
                     // teardown 去追平它。
                     await sessionStartPromise;
+
+                    // A DIFFERENT start took over while this one was waiting.
+                    // On mobile the composer stays visible during an audio
+                    // session, so the user can send text inside the ack's 500ms
+                    // settle window; app-websocket.js then leaves
+                    // _pendingSessionStartMode owned by that newer text start
+                    // and settles this promise anyway (it has no timeout left,
+                    // so nothing else ever would). Opening the microphone now
+                    // would reclaim a lease onto the text session's blocked
+                    // route -- and NONE of the guards below can see it: the
+                    // text ack changes neither voiceSessionStartEpoch nor
+                    // isMicStarting, so ensureVoiceStartCurrent passes, and it
+                    // never sets voiceInputRouteBlocked either (Codex P2).
+                    //
+                    // abortVoiceStartForBlockedRoute rather than throwing: the
+                    // generic catch clears S.sessionStartedResolver /
+                    // Rejecter / _pendingSessionStartMode unconditionally,
+                    // which would tear down the very start that superseded us.
+                    if (S._pendingSessionStartMode
+                            && S._pendingSessionStartMode !== 'audio') {
+                        // Deliberately NOT clearing window.sessionTimeoutId:
+                        // that timer belongs to the newer start now, and
+                        // cancelling it is the same cross-start damage in
+                        // miniature.
+                        if (typeof window.abortVoiceStartForBlockedRoute === 'function') {
+                            window.abortVoiceStartForBlockedRoute();
+                        }
+                        return;
+                    }
+
                     ensureVoiceStartCurrent();
 
                     if (window.sessionTimeoutId) {
@@ -2210,6 +2254,16 @@
                         window.sessionTimeoutId = null;
                     }
 
+                    if (S.voiceInputRouteBlocked === true) {
+                        // The route came back fail-closed (independent ASR was
+                        // enabled and failed to start). Do not open the mic;
+                        // unwind the starting-voice UI so the button is usable
+                        // again, and let the ASR failure toast stand.
+                        if (typeof window.abortVoiceStartForBlockedRoute === 'function') {
+                            window.abortVoiceStartForBlockedRoute();
+                        }
+                        return;
+                    }
                     await window.startMicCapture();
                     ensureVoiceStartCurrent();
                 } catch (error) {

@@ -929,7 +929,14 @@
         "volumeWaiting": "Ожидание",
         "volumeHintWaiting": "Микрофон слушает, можете говорить",
         "noiseReduction": "Шумоподавление",
-        "noiseReductionHint": "Шумоподавление RNNoise AI для более чистого голоса"
+        "noiseReductionHint": "Шумоподавление RNNoise AI для более чистого голоса",
+        "independentAsr": "Независимое распознавание речи",
+        "independentAsrActive": "Активен независимый ASR: {{provider}}",
+        "independentAsrFallback": "Независимый ASR недоступен. Голосовой ввод в этом сеансе остановлен. Проверьте настройки независимого ASR, затем начните новый голосовой сеанс.",
+        "audioPreprocessingFailed": "Не удалось обработать звук микрофона. Голосовой ввод в этой сессии остановлен. Начните новую голосовую сессию.",
+        "independentAsrProviderUnavailable": "{{provider}} временно недоступен. Голосовой ввод в этом сеансе остановлен. Переключения на другую службу распознавания речи не произошло. Начните новый голосовой сеанс позже.",
+        "independentAsrNextSession": "Будет включён в следующем голосовом сеансе; при недоступности автоматического переключения на Omni не произойдёт.",
+        "independentAsrNative": "Используется встроенное распознавание речи Omni"
     },
     "speaker": {
         "volumeLabel": "Громкость динамика",
@@ -1028,7 +1035,13 @@
             "silicon": "SiliconFlow",
             "gemini": "Gemini",
             "kimi_code": "Moonshot Kimi Code",
-            "vllm_omni": "vLLM-Omni (TTS)"
+            "vllm_omni": "vLLM-Omni (TTS)",
+            "qwen": "Qwen",
+            "grok": "Grok",
+            "soniox": "Soniox",
+            "free": "Бесплатная версия",
+            "dummy": "Тестовый провайдер",
+            "unknown": "Неизвестный провайдер"
         },
         "coreProviderNames": {
             "free": "Бесплатная версия (Эксклюзив N.E.K.O., веб-поиск)",

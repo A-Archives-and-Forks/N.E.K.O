@@ -30,9 +30,20 @@ from ._shared import (
 from ._proactive_audio import (
     _load_proactive_audio,
 )
+from ._response_arbiter import RealtimeResponseArbiter
 
 
 class _ResponseMixin:
+    def _ensure_response_arbiter(self) -> RealtimeResponseArbiter:
+        arbiter = getattr(self, "_response_arbiter", None)
+        if arbiter is None:
+            arbiter = RealtimeResponseArbiter(
+                self.send_event,
+                abort_transport=getattr(self, "_abort_failed_transport", None),
+            )
+            self._response_arbiter = arbiter
+        return arbiter
+
     async def prime_context(self, text: str, skipped: bool = False) -> None:
         """Inject context during hot-swap.
 
@@ -133,9 +144,15 @@ class _ResponseMixin:
         if skipped:
             self._skip_until_next_response = True
 
-        # 通过 conversation.item.create 添加用户消息，再触发响应
+        item_event_id = f"event_user_item_{uuid.uuid4().hex}"
+        response_event_id = f"event_user_response_{uuid.uuid4().hex}"
+        item_id = f"item_neko_{uuid.uuid4().hex}"
+        expected_item_id = item_id
+        # 通过 conversation.item.create 添加用户消息，再触发响应。两步都
+        # 进入全局仲裁器，直到 response.done 才释放下一次 create 的资格。
         item_event = {
             "type": "conversation.item.create",
+            "event_id": item_event_id,
             "item": {
                 "type": "message",
                 "role": "user",
@@ -147,10 +164,161 @@ class _ResponseMixin:
                 ]
             }
         }
-        await self.send_event(item_event)
-
+        if expected_item_id is not None:
+            item_event["item"]["id"] = item_id
         logger.info("Creating response with user message")
-        await self.send_event({"type": "response.create"})
+        ticket = await self._ensure_response_arbiter().enqueue(
+            source="create_response",
+            events_before_response=(item_event,),
+            response_event={
+                "type": "response.create",
+                "event_id": response_event_id,
+            },
+            ack_expected=True,
+            expected_item_id=expected_item_id,
+            expected_item_role="user",
+        )
+        await ticket.sent
+
+    async def submit_external_text_turn(self, text: str, *, turn_id: str):
+        """Persist one completed ASR turn and request a reply.
+
+        The transcript is stored as a user conversation item, then a bare
+        ``response.create`` is issued — the same pattern as
+        ``create_response`` and the proactive inject path. Do not attach
+        per-response ``response.instructions`` here: OpenAI Realtime and
+        compatible protocols treat them as a replacement for the session
+        instructions (the persona system prompt), not an addition. Item
+        transport loss is covered by the arbiter's item-ack barrier. The
+        caller must pass only a Smart Turn completion, never an ASR partial
+        or segment final.
+        """
+        if getattr(self, "_is_gemini", False):
+            raise RuntimeError(
+                "external ASR text turns use the existing Gemini SDK path"
+            )
+
+        import hashlib
+
+        clean = str(text or "").strip()
+        if not clean:
+            raise ValueError("external ASR turn must not be empty")
+        if len(clean) > 8_000:
+            raise ValueError("external ASR turn exceeds the 8000 character budget")
+        stable_turn_id = str(turn_id or "").strip()
+        if not stable_turn_id:
+            raise ValueError("external ASR turn_id must not be empty")
+
+        event_suffix = uuid.uuid4().hex
+        item_id = f"item_neko_{uuid.uuid4().hex}"
+        expected_item_id = item_id
+        item_event = {
+            "type": "conversation.item.create",
+            "event_id": f"event_asr_item_{event_suffix}",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": clean}],
+            },
+        }
+        if expected_item_id is not None:
+            item_event["item"]["id"] = item_id
+        response_event = {
+            "type": "response.create",
+            "event_id": f"event_asr_response_{event_suffix}",
+        }
+        text_hash = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:8]
+        logger.info(
+            "external_turn queued turn=%s chars=%d hash=%s",
+            stable_turn_id,
+            len(clean),
+            text_hash,
+        )
+        arbiter = self._ensure_response_arbiter()
+        ticket = await arbiter.enqueue(
+            source="external_asr",
+            events_before_response=(item_event,),
+            response_event=response_event,
+            ack_expected=True,
+            expected_item_id=expected_item_id,
+            expected_item_role="user",
+            priority=0,
+        )
+        # Speech-start pauses dispatch. Resume only after this priority-0 user
+        # turn is present, so queued proactive work cannot win the race. An
+        # older completed turn may still be ahead of a newer paused turn in
+        # the serial transcript dispatcher; let that ticket through, then
+        # restore the newer pause before lower-priority work can run.
+        # NOTE(py3.11): the resume -> await sent -> re-pause hand-off below
+        # relies on the arbiter worker suspending between resolving
+        # ``ticket.sent`` and dequeuing its next queued item, so the re-pause
+        # lands before lower-priority work can pass the dispatch gate. That
+        # holds on the pinned Python 3.11 event loop (3.11's ``wait_for``
+        # always yields once even on a done future) but is not a documented
+        # asyncio guarantee on 3.12+ (the rewritten ``wait_for`` awaits a done
+        # future without suspending). A structural fix needs the arbiter
+        # itself to gate every dequeue on the active external-turn pause.
+        active_pause_id = getattr(self, "_external_voice_turn_pause_id", None)
+        if active_pause_id == stable_turn_id:
+            self._external_voice_turn_pause_id = None
+        arbiter.resume_dispatch()
+        try:
+            await ticket.sent
+        finally:
+            # Re-arm the newer turn's pause on the failure path too: a
+            # transport error (or a newer prepare's cancel_current) can fail
+            # ``ticket.sent`` after the resume above already released that
+            # newer turn's pause, and without this re-pause queued proactive
+            # work could dispatch ahead of that turn's user text.
+            if (
+                active_pause_id is not None
+                and active_pause_id != stable_turn_id
+                and getattr(self, "_external_voice_turn_pause_id", None)
+                == active_pause_id
+            ):
+                arbiter.pause_dispatch()
+        return ticket
+
+    async def prepare_external_voice_turn(self, *, turn_id: str) -> None:
+        """Prepare the active Provider session for one external ASR turn."""
+
+        stable_turn_id = str(turn_id or "").strip()
+        if not stable_turn_id:
+            raise ValueError("external voice turn_id must not be empty")
+        try:
+            if not self._is_gemini:
+                arbiter = self._ensure_response_arbiter()
+                self._external_voice_turn_pause_id = stable_turn_id
+                arbiter.pause_dispatch()
+                await arbiter.cancel_current()
+            await self.handle_interruption()
+        except BaseException:
+            self.abandon_external_voice_turn(stable_turn_id)
+            raise
+
+    def abandon_external_voice_turn(self, turn_id: str | None = None) -> None:
+        """Release an external-ASR dispatch pause, optionally by turn key."""
+
+        if self._is_gemini:
+            return
+        current_turn_id = getattr(self, "_external_voice_turn_pause_id", None)
+        if turn_id is not None and str(turn_id).strip() != current_turn_id:
+            return
+        self._external_voice_turn_pause_id = None
+        arbiter = getattr(self, "_response_arbiter", None)
+        if arbiter is None:
+            if current_turn_id is None:
+                return
+            arbiter = self._ensure_response_arbiter()
+        arbiter.resume_dispatch()
+
+    async def submit_external_voice_turn(self, text: str, *, turn_id: str) -> None:
+        """Submit external ASR text through the Provider-appropriate path."""
+
+        if self._is_gemini:
+            await self.create_response(text)
+            return
+        await self.submit_external_text_turn(text, turn_id=turn_id)
 
     def is_active_response(self) -> bool:
         """Return True iff the realtime session is currently producing a response.
@@ -161,7 +329,7 @@ class _ResponseMixin:
         response" against the realtime API's "one active response at a time"
         constraint.
         """
-        return bool(self._is_responding)
+        return bool(self._is_responding or self._ensure_response_arbiter().is_busy)
 
     async def inject_text_and_request_response(
         self,
@@ -251,12 +419,11 @@ class _ResponseMixin:
         # useless for rejection matching since the caller has no view of it.
         # A single ``_reject_once`` wrapper fires ``on_rejected`` at most once
         # even if both event_ids somehow error, and unregisters both handlers.
-        item_event_id: Optional[str] = None
-        create_event_id: Optional[str] = None
+        item_event_id = f"event_inject_item_{uuid.uuid4().hex}"
+        create_event_id = f"event_inject_resp_{uuid.uuid4().hex}"
+        item_id = f"item_neko_{uuid.uuid4().hex}"
+        expected_item_id = item_id
         if on_rejected is not None:
-            item_event_id = f"event_inject_item_{uuid.uuid4().hex}"
-            create_event_id = f"event_inject_resp_{uuid.uuid4().hex}"
-
             _fired = False
 
             def _reject_once(error_msg: str) -> None:
@@ -303,8 +470,9 @@ class _ResponseMixin:
                 ],
             },
         }
-        if item_event_id is not None:
-            item_event["event_id"] = item_event_id
+        if expected_item_id is not None:
+            item_event["item"]["id"] = item_id
+        item_event["event_id"] = item_event_id
 
         # send_event() silently returns when ws drops to None or fatal flag
         # flips mid-flight (it does not raise). Without the post-send checks,
@@ -316,24 +484,25 @@ class _ResponseMixin:
         # handlers so the caller's ``except`` path is the single source of
         # truth and a late error event can't double-fire the re-queue.
         try:
-            await self.send_event(item_event)
-            if self._fatal_error_occurred or self.ws is None:
-                raise RuntimeError(
-                    "realtime connection lost after proactive conversation.item.create"
-                )
             create_event: Dict[str, Any] = {"type": "response.create"}
-            if create_event_id is not None:
-                create_event["event_id"] = create_event_id
-            await self.send_event(create_event)
+            create_event["event_id"] = create_event_id
+            ticket = await self._ensure_response_arbiter().enqueue(
+                source="proactive",
+                events_before_response=(item_event,),
+                response_event=create_event,
+                ack_expected=True,
+                expected_item_id=expected_item_id,
+                expected_item_role="user",
+                priority=20,
+            )
+            await ticket.sent
             if self._fatal_error_occurred or self.ws is None:
                 raise RuntimeError(
                     "realtime connection lost after proactive response.create"
                 )
         except Exception:
-            if item_event_id is not None:
-                self._inject_rejection_handlers.pop(item_event_id, None)
-            if create_event_id is not None:
-                self._inject_rejection_handlers.pop(create_event_id, None)
+            self._inject_rejection_handlers.pop(item_event_id, None)
+            self._inject_rejection_handlers.pop(create_event_id, None)
             raise
 
     async def _expire_inject_rejection_handler(self, event_id: str, ttl: float) -> None:
@@ -672,9 +841,9 @@ class _ResponseMixin:
         finally:
             self._proactive_injecting = False
 
-    async def cancel_response(self) -> None:
+    async def cancel_response(self, *, wait: bool = False, timeout: float = 3.0) -> None:
         """Cancel the current response."""
-        event = {
-            "type": "response.cancel"
-        }
-        await self.send_event(event)
+        if wait:
+            await self._ensure_response_arbiter().cancel_current(timeout)
+            return
+        await self.send_event({"type": "response.cancel"})
