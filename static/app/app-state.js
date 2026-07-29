@@ -139,6 +139,10 @@
         // 不一致（典型是 proactive/greeting 并发自起的 text 会话发来的 ack）时
         // 忽略，避免错误模式的 ack 收口用户的启动 promise / 翻转会话状态。
         _pendingSessionStartMode: null,
+        // 上一次 claim 的模式，释放后依然保留（_pendingSessionStartMode 会被清空）。
+        // 用于判断"抢走槽位的那个启动是不是语音启动"——它可能已经 ack 完并释放，
+        // 但仍然活着且正在驱动语音 UI，见 supersededByAudioStart。
+        _lastSessionStartMode: null,
         voiceSessionStartEpoch: 0,
         assistantTurnId: null,
         assistantTurnStartedAt: 0,
@@ -267,10 +271,55 @@
     // cancelPendingSessionStart stays deliberately unconditional because it is
     // the global "abandon whatever is pending" lever (goodbye, avatar drop,
     // character switch), where killing a foreign start is the intent.
+    // An owner token answers "who holds the slot RIGHT NOW", and that is not
+    // enough on its own: a start that claimed after us and has since finished
+    // or been cancelled leaves the slot empty again -- byte for byte what our
+    // own release looks like. Three separate review findings reduced to that
+    // one blind spot. A claim sequence closes it, because it only ever moves
+    // forward: "somebody claimed after me" survives their departure. The
+    // WeakMap keeps it off the tokens themselves and out of GC's way.
+    var startClaimSeq = 0;
+    var startClaimSeqByOwner = new WeakMap();
+    // The sequence of the last AUDIO claim, tracked separately because "was the
+    // takeover a voice start" is not the same question as "what claimed last":
+    // a text send can claim after a newer audio start that is still acquiring
+    // its microphone, and the mode of the last claim then says 'text' while an
+    // audio start is very much alive and holding the state the global unwind
+    // destroys.
+    var lastAudioClaimSeq = 0;
+
     window.claimSessionStart = function (mode, resolve, reject) {
+        // Whoever we are about to displace can no longer be settled by anything
+        // else, so settle them HERE. Their acknowledgement is dropped by the
+        // cross-mode guard in the session_started handler once our mode is the
+        // pending one, and their 15s timeout is cancelled a few lines later by
+        // the very flow that is claiming -- every claim setup clears the shared
+        // window.sessionTimeoutId. A displaced start that nobody settles sits on
+        // `await sessionStartPromise` forever, holding window.isMicStarting and
+        // an active/disabled mic button straight through OUR session.
+        //
+        // A cancellation, not a failure: makeNekoSessionAbortError marks it so
+        // the flows treat it as "abandoned", not "start failed".
+        var displaced = S.sessionStartedRejecter;
+
         S.sessionStartedResolver = resolve;
         S.sessionStartedRejecter = reject;
         S._pendingSessionStartMode = mode;
+        startClaimSeq += 1;
+        startClaimSeqByOwner.set(resolve, startClaimSeq);
+        if (mode === 'audio') lastAudioClaimSeq = startClaimSeq;
+        // After the slot is ours, so anything the displaced flow does on its way
+        // out already sees the new owner and stands down against it.
+        if (displaced) {
+            try {
+                displaced(window.makeNekoSessionAbortError('Session start superseded by a newer start'));
+            } catch (_) { }
+        }
+        // Sticky twin of _pendingSessionStartMode: which KIND of start claimed
+        // last, still readable after it has released. supersededByAudioStart
+        // needs it to decide whether the global voice-start unwind would land
+        // on a live voice start, and by then the pending mode may be gone.
+        S._lastSessionStartMode = mode;
         return resolve;
     };
 
@@ -283,9 +332,103 @@
         return true;
     };
 
+    /**
+     * The current claim count, for a flow that must detect takeovers BEFORE it
+     * has an owner token of its own -- the automatic restart spends 7.5s in a
+     * timer before it claims, and a text session can be started and finished
+     * whole inside that window. Snapshot this when the work is scheduled and
+     * ask sessionStartsSince when it runs.
+     */
+    window.sessionStartClaimSeq = function () {
+        return startClaimSeq;
+    };
+
+    /** True when any start has claimed since ``seq`` was taken. */
+    window.sessionStartsSince = function (seq) {
+        return startClaimSeq > seq;
+    };
+
+    /** True when an AUDIO start has claimed since ``seq`` was taken. */
+    window.audioStartsSince = function (seq) {
+        return lastAudioClaimSeq > seq;
+    };
+
     /** True while ``owner`` is still the pending start. */
     window.sessionStartIsCurrent = function (owner) {
         return !!owner && S.sessionStartedResolver === owner;
+    };
+
+    /**
+     * True when ANY start claimed after ``owner`` did -- whether it still holds
+     * the slot, has completed, or was cancelled.
+     *
+     * Not "somebody else holds the slot now", which misses a completed takeover:
+     * a text send can claim and be acknowledged inside an audio start's
+     * getUserMedia await, releasing the slot before that start resumes, and the
+     * stale start would then read an empty slot and go on to end the session and
+     * rewrite the UI the text session is using. Not
+     * `!sessionStartIsCurrent(owner)` either, which misses nothing but flags
+     * everything: the normal success path releases the slot inside the ack
+     * handler before settling the promise, so a start that simply succeeded also
+     * resumes to an empty slot, and it must still clear the timeout it armed.
+     * The claim sequence separates the two: it moved iff somebody else started.
+     */
+    window.sessionStartSuperseded = function (owner) {
+        var seq = owner ? startClaimSeqByOwner.get(owner) : undefined;
+        // An owner we never minted (or none at all): all we can say is whether
+        // somebody is pending right now.
+        if (seq === undefined) {
+            return !!S.sessionStartedResolver && S.sessionStartedResolver !== owner;
+        }
+        return startClaimSeq > seq;
+    };
+
+    /**
+     * True when the start that superseded ``owner`` is itself an AUDIO start.
+     *
+     * It matters because the superseded flow's unwind --
+     * abortVoiceStartForBlockedRoute -- is GLOBAL: it bumps the mic generation
+     * (invalidatePendingMicStart) and clears window.isMicStarting, which is
+     * exactly the state a newer AUDIO start is relying on while it sits in
+     * getUserMedia / addModule. Running it there makes that start abandon
+     * capture and then fail its own ensureVoiceStartCurrent, leaving a session
+     * the backend accepted with the microphone closed. A newer TEXT start
+     * touches none of that state and leaves the voice-start UI stranded
+     * instead, so there the unwind must still run.
+     */
+    window.supersededByAudioStart = function (owner) {
+        var seq = owner ? startClaimSeqByOwner.get(owner) : undefined;
+        // "Did an audio start claim after me", not "was the last claim audio".
+        // With A superseded by an audio B that is still acquiring and then by a
+        // text C, the last claim is C -- and unwinding on that verdict bumps the
+        // mic generation out from under B, whose session the backend has already
+        // accepted. Asking about audio claims after our own sequence keeps B
+        // visible however many text starts follow it.
+        if (seq === undefined) {
+            // No token we minted: the sticky mode is all that is left. Callers
+            // that must decide before they own anything pass their scheduling
+            // snapshot to audioStartsSince instead.
+            return window.sessionStartSuperseded(owner)
+                && S._lastSessionStartMode === 'audio';
+        }
+        return lastAudioClaimSeq > seq;
+    };
+
+    /**
+     * True while ``epoch`` is still the newest voice-start intent.
+     *
+     * Ownership cannot see an ABA: a newer start may claim the slot inside the
+     * ack's 500ms deferred-resolution window and then be cancelled or complete,
+     * leaving the slot back at EMPTY -- indistinguishable, to
+     * sessionStartSuperseded, from "my own ack released it". The epoch can tell
+     * them apart, because it only ever moves forward and only on a NEWER voice
+     * intent: every mic-button press mints one, and cancelPendingSessionStart
+     * -- the global abandon lever behind goodbye, avatar drop and character
+     * switch -- bumps it. A flow that snapshots it when it claims can check
+     * after its await whether the user has moved on.
+     */
+    window.voiceStartEpochIsCurrent = function (epoch) {
+        return S.voiceSessionStartEpoch === epoch;
     };
 
     window.cancelPendingSessionStart = function (reason) {
