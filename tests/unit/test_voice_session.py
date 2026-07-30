@@ -324,6 +324,30 @@ async def test_receive_text_delta(realtime_client):
 
 
 @pytest.mark.unit
+async def test_cancelled_response_done_is_forwarded_to_response_arbiter(
+    realtime_client,
+):
+    realtime_client.ws = AsyncMock()
+    realtime_client.ws.__aiter__.return_value = [
+        json.dumps({
+            "type": "response.done",
+            "response": {"id": "resp_cancelled", "status": "cancelled"},
+        }),
+    ]
+    realtime_client._response_arbiter.notify_response_terminal = MagicMock()
+    realtime_client.on_response_done = AsyncMock()
+
+    await realtime_client.handle_messages()
+
+    realtime_client._response_arbiter.notify_response_terminal.assert_called_once_with(
+        {
+            "type": "response.done",
+            "response": {"id": "resp_cancelled", "status": "cancelled"},
+        }
+    )
+
+
+@pytest.mark.unit
 async def test_late_delta_from_cancelled_response_is_not_forwarded_after_new_response():
     client = _make_manual_client(model="gpt-4o-realtime-preview", api_type="openai")
     events = [

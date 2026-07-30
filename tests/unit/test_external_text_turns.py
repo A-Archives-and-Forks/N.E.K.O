@@ -6,12 +6,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from main_logic.omni_realtime_client import OmniRealtimeClient
-from main_logic.omni_realtime_client._response_arbiter import (
-    _DEFAULT_RESPONSE_DONE_TIMEOUT,
-    _SERVER_RESPONSE_ID_LIMIT,
-    RealtimeResponseArbiter,
-)
+import main_logic.omni_realtime_client._response_arbiter as arbiter_module
 from main_logic.tool_calling import ToolResult
+
+_DEFAULT_RESPONSE_DONE_TIMEOUT = arbiter_module._DEFAULT_RESPONSE_DONE_TIMEOUT
+_SERVER_RESPONSE_ID_LIMIT = arbiter_module._SERVER_RESPONSE_ID_LIMIT
+RealtimeResponseArbiter = arbiter_module.RealtimeResponseArbiter
 
 
 async def _wait_for_arbiter_source(
@@ -81,6 +81,78 @@ async def test_barge_in_cancelled_response_done_releases_response_lane():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_terminal_after_started_timeout_does_not_fail_closed():
+    sent = []
+    aborted = []
+    arbiter = None
+
+    async def send(event):
+        sent.append(dict(event))
+        if event["type"] == "response.cancel":
+            arbiter.notify_response_terminal(
+                {
+                    "type": "response.done",
+                    "response": {"status": "cancelled"},
+                }
+            )
+
+    async def abort(reason):
+        aborted.append(reason)
+
+    arbiter = RealtimeResponseArbiter(send, abort_transport=abort)
+    ticket = await arbiter.enqueue(
+        source="started-timeout",
+        response_started_timeout=0.01,
+        cancel_timeout=0.2,
+    )
+
+    await asyncio.wait_for(ticket.sent, 0.2)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(ticket.done, 0.5)
+
+    assert [event["type"] for event in sent] == [
+        "response.create",
+        "response.cancel",
+    ]
+    assert aborted == []
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_reports_ticket_failure_without_aborting_transport():
+    aborted = []
+    arbiter = None
+
+    async def send(event):
+        if event["type"] != "response.create":
+            return
+        arbiter.notify_response_created(
+            {"type": "response.created", "response": {"id": "resp-cancelled"}}
+        )
+        arbiter.notify_response_terminal(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "resp-cancelled",
+                    "status": "cancelled",
+                },
+            }
+        )
+
+    async def abort(reason):
+        aborted.append(reason)
+
+    arbiter = RealtimeResponseArbiter(send, abort_transport=abort)
+    ticket = await arbiter.enqueue(source="server-cancelled")
+
+    with pytest.raises(RuntimeError, match="status=cancelled"):
+        await asyncio.wait_for(ticket.done, 0.2)
+
+    assert aborted == []
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_response_arbiter_holds_lane_until_response_done():
     sent = []
     arbiter = None
@@ -109,6 +181,44 @@ async def test_response_arbiter_holds_lane_until_response_done():
         "response.create",
         "response.create",
     ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_ticket_after_terminal_does_not_cancel_new_server_response():
+    sent = []
+    arbiter = None
+
+    async def send(event):
+        sent.append(dict(event))
+
+    arbiter = RealtimeResponseArbiter(send)
+    ticket = await arbiter.enqueue(source="completed-owner")
+    while not sent:
+        await asyncio.sleep(0)
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-owner"}}
+    )
+    await asyncio.wait_for(ticket.started, 0.2)
+
+    # The terminal future resolves synchronously, but the worker does not
+    # remove the ticket mapping until it resumes. A server-VAD response can
+    # start in that gap; cancelling the completed ticket must not send the
+    # unscoped response.cancel into the newer response.
+    arbiter.notify_response_terminal(
+        {"type": "response.done", "response": {"id": "resp-owner"}}
+    )
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-server"}}
+    )
+    cancellation_requested = await arbiter.cancel_ticket(ticket, wait=False)
+
+    assert cancellation_requested is False
+    assert [event["type"] for event in sent] == ["response.create"]
+    await asyncio.wait_for(ticket.done, 0.2)
+    arbiter.notify_response_terminal(
+        {"type": "response.done", "response": {"id": "resp-server"}}
+    )
+    await arbiter.shutdown()
 
 
 @pytest.mark.asyncio
@@ -680,6 +790,244 @@ async def test_matching_item_event_error_fails_current_item_ack():
 
 
 @pytest.mark.asyncio
+async def test_pre_event_rejection_after_item_ack_stops_response_create():
+    sent = []
+    item_sent = asyncio.Event()
+
+    async def send(event):
+        sent.append(dict(event))
+        if event["type"] == "conversation.item.create":
+            item_sent.set()
+
+    arbiter = RealtimeResponseArbiter(send)
+    ticket = await arbiter.enqueue(
+        source="proactive",
+        events_before_response=(
+            {
+                "type": "conversation.item.create",
+                "event_id": "description-event",
+                "item": {"id": "description-item", "role": "user"},
+            },
+        ),
+        response_event={
+            "type": "response.create",
+            "event_id": "response-event",
+        },
+        ack_expected=True,
+        expected_item_id="description-item",
+        expected_item_role="user",
+    )
+    await asyncio.wait_for(item_sent.wait(), 0.2)
+
+    arbiter.notify_item_created(
+        {"item": {"id": "description-item", "role": "user"}}
+    )
+    arbiter.notify_error("description-event", "description rejected")
+
+    for future in (ticket.sent, ticket.started, ticket.done):
+        with pytest.raises(RuntimeError, match="description rejected"):
+            await asyncio.wait_for(future, 0.2)
+    assert [event["type"] for event in sent] == [
+        "conversation.item.create"
+    ]
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_vad_pending_interrupts_pre_owner_item_ack_before_create():
+    sent = []
+    item_sent = asyncio.Event()
+
+    async def send(event):
+        sent.append(dict(event))
+        if event["type"] == "conversation.item.create":
+            item_sent.set()
+
+    arbiter = RealtimeResponseArbiter(send)
+    interrupted = await arbiter.enqueue(
+        source="proactive",
+        events_before_response=(
+            {
+                "type": "conversation.item.create",
+                "event_id": "item-pre-owner",
+                "item": {"id": "item-pre-owner", "role": "user"},
+            },
+        ),
+        response_event={
+            "type": "response.create",
+            "event_id": "response-pre-owner",
+        },
+        ack_expected=True,
+        expected_item_id="item-pre-owner",
+        expected_item_role="user",
+    )
+    await asyncio.wait_for(item_sent.wait(), 0.2)
+
+    arbiter.notify_server_vad_response_pending()
+    follow_up = await arbiter.enqueue(source="follow-up")
+
+    with pytest.raises(RuntimeError, match="pending server VAD"):
+        await asyncio.wait_for(interrupted.done, 0.2)
+    await asyncio.sleep(0)
+    assert [event["type"] for event in sent] == [
+        "conversation.item.create"
+    ]
+    assert follow_up.sent.done() is False
+    assert arbiter.is_busy is True
+
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-vad"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-vad", "status": "completed"},
+        }
+    )
+    await asyncio.wait_for(follow_up.sent, 0.2)
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-follow-up"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-follow-up",
+                "status": "completed",
+            },
+        }
+    )
+    await asyncio.wait_for(follow_up.done, 0.2)
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pre_response_error_during_create_send_retains_owner():
+    sent = []
+    create_started = asyncio.Event()
+    release_create = asyncio.Event()
+    aborted = []
+
+    async def send(event):
+        sent.append(dict(event))
+        if event.get("event_id") == "response-create-race":
+            create_started.set()
+            await release_create.wait()
+
+    async def abort(reason):
+        aborted.append(reason)
+
+    arbiter = RealtimeResponseArbiter(send, abort_transport=abort)
+    raced = await arbiter.enqueue(
+        source="proactive",
+        events_before_response=(
+            {
+                "type": "conversation.item.create",
+                "event_id": "item-create-race",
+                "item": {"id": "item-create-race", "role": "user"},
+            },
+        ),
+        response_event={
+            "type": "response.create",
+            "event_id": "response-create-race",
+        },
+    )
+    await asyncio.wait_for(create_started.wait(), 0.2)
+    follow_up = await arbiter.enqueue(source="follow-up")
+
+    arbiter.notify_error(
+        "item-create-race",
+        "late pre-response item rejection",
+    )
+    with pytest.raises(RuntimeError, match="late pre-response"):
+        await asyncio.wait_for(raced.done, 0.2)
+
+    release_create.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert arbiter._response_owner is not None
+    assert follow_up.sent.done() is False
+    assert any(event["type"] == "response.cancel" for event in sent)
+
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-raced"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-raced", "status": "cancelled"},
+        }
+    )
+    await asyncio.wait_for(follow_up.sent, 0.2)
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-follow-up"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-follow-up",
+                "status": "completed",
+            },
+        }
+    )
+    await asyncio.wait_for(follow_up.done, 0.2)
+    assert aborted == []
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_vad_pending_quarantines_response_create_send_in_progress():
+    sent = []
+    create_started = asyncio.Event()
+    release_create = asyncio.Event()
+
+    async def send(event):
+        sent.append(dict(event))
+        if event["type"] == "response.create" and not create_started.is_set():
+            create_started.set()
+            await release_create.wait()
+
+    arbiter = RealtimeResponseArbiter(send)
+    interrupted = await arbiter.enqueue(source="proactive")
+    await asyncio.wait_for(create_started.wait(), 0.2)
+
+    arbiter.notify_server_vad_response_pending()
+    follow_up = await arbiter.enqueue(source="follow-up")
+    release_create.set()
+
+    with pytest.raises(RuntimeError, match="pending server VAD"):
+        await asyncio.wait_for(interrupted.done, 0.2)
+    assert follow_up.sent.done() is False
+    assert [event["type"] for event in sent] == ["response.create"]
+
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-vad"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-vad", "status": "completed"},
+        }
+    )
+    await asyncio.wait_for(follow_up.sent, 0.2)
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-follow-up"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-follow-up",
+                "status": "completed",
+            },
+        }
+    )
+    await asyncio.wait_for(follow_up.done, 0.2)
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_response_conflict_is_terminal_and_not_retried():
     sent = []
     arbiter = None
@@ -700,6 +1048,412 @@ async def test_response_conflict_is_terminal_and_not_retried():
     with pytest.raises(RuntimeError, match="active response"):
         await ticket.done
     assert [event["type"] for event in sent].count("response.create") == 1
+
+
+@pytest.mark.asyncio
+async def test_vad_during_item_ack_keeps_only_server_response_owner():
+    sent = []
+    aborted = []
+    arbiter = None
+
+    async def send(event):
+        sent.append(dict(event))
+        if event["type"] == "conversation.item.create":
+            arbiter.notify_response_created(
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp-vad"},
+                }
+            )
+            arbiter.notify_item_created(
+                {"item": {"id": "item-proactive", "role": "user"}}
+            )
+        elif event.get("event_id") == "response-proactive":
+            arbiter.notify_error(
+                "response-proactive",
+                "invalid_request_error: Conversation already has an active response",
+            )
+        elif event.get("event_id") == "response-follow-up":
+            arbiter.notify_response_created(
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp-follow-up"},
+                }
+            )
+
+    async def abort(reason):
+        aborted.append(reason)
+
+    arbiter = RealtimeResponseArbiter(send, abort_transport=abort)
+    proactive = await arbiter.enqueue(
+        source="proactive",
+        events_before_response=(
+            {
+                "type": "conversation.item.create",
+                "event_id": "item-event",
+                "item": {"id": "item-proactive", "role": "user"},
+            },
+        ),
+        response_event={
+            "type": "response.create",
+            "event_id": "response-proactive",
+        },
+        ack_expected=True,
+        expected_item_id="item-proactive",
+        expected_item_role="user",
+    )
+    follow_up = await arbiter.enqueue(
+        source="follow-up",
+        response_event={
+            "type": "response.create",
+            "event_id": "response-follow-up",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="active response"):
+        await asyncio.wait_for(proactive.done, 0.2)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert arbiter._response_owner is None
+    assert arbiter.is_busy is True
+    assert follow_up.sent.done() is False
+    assert aborted == []
+
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-vad"},
+        }
+    )
+    await asyncio.wait_for(follow_up.sent, 0.2)
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-follow-up"},
+        }
+    )
+    await asyncio.wait_for(follow_up.done, 0.2)
+    assert [event["type"] for event in sent] == [
+        "conversation.item.create",
+        "response.create",
+        "response.create",
+    ]
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_vad_created_during_create_send_is_not_credited_to_owner():
+    sent = []
+    arbiter = None
+
+    async def send(event):
+        sent.append(dict(event))
+        if event.get("event_id") != "response-proactive":
+            return
+        # The VAD utterance ended before this explicit create finished sending,
+        # so its automatic response owns the response.created race.
+        arbiter.notify_server_vad_response_pending()
+        arbiter.notify_response_created(
+            {
+                "type": "response.created",
+                "response": {"id": "resp-vad"},
+            }
+        )
+        arbiter.notify_response_terminal(
+            {
+                "type": "response.done",
+                "response": {"id": "resp-vad", "status": "completed"},
+            }
+        )
+        arbiter.notify_error(
+            "response-proactive",
+            "invalid_request_error: Conversation already has an active response",
+        )
+
+    arbiter = RealtimeResponseArbiter(send)
+    proactive = await arbiter.enqueue(
+        source="proactive",
+        response_event={
+            "type": "response.create",
+            "event_id": "response-proactive",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="active response"):
+        await asyncio.wait_for(proactive.done, 0.2)
+    await arbiter.wait_until_idle(0.2)
+
+    assert proactive.started.done()
+    assert proactive.started.exception() is not None
+    assert arbiter._response_owner is None
+    assert arbiter._server_response_ids == {}
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_vad_pending_response_holds_lane_before_created_event():
+    sent = []
+
+    async def send(event):
+        sent.append(dict(event))
+
+    arbiter = RealtimeResponseArbiter(send)
+    arbiter.notify_server_vad_response_pending()
+    follow_up = await arbiter.enqueue(source="follow-up")
+
+    await asyncio.sleep(0.01)
+    assert arbiter.is_busy
+    assert follow_up.sent.done() is False
+    assert sent == []
+
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-vad"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-vad", "status": "completed"},
+        }
+    )
+    await asyncio.wait_for(follow_up.sent, 0.2)
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-follow-up"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-follow-up", "status": "completed"},
+        }
+    )
+    await asyncio.wait_for(follow_up.done, 0.2)
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_vad_pending_response_timeout_reopens_lane(monkeypatch):
+    sent = []
+
+    async def send(event):
+        sent.append(dict(event))
+
+    monkeypatch.setattr(
+        arbiter_module,
+        "_SERVER_VAD_RESPONSE_STARTED_TIMEOUT",
+        0.01,
+    )
+    arbiter = RealtimeResponseArbiter(send)
+    arbiter.notify_server_vad_response_pending()
+    follow_up = await arbiter.enqueue(source="follow-up")
+
+    assert follow_up.sent.done() is False
+    assert arbiter._server_vad_pending_handle is not None
+
+    await asyncio.wait_for(follow_up.sent, 0.2)
+    arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-follow-up"}}
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-follow-up", "status": "completed"},
+        }
+    )
+    await asyncio.wait_for(follow_up.done, 0.2)
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_vad_pending_timeout_starts_after_blocked_receive_callback(monkeypatch):
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    async def on_new_message():
+        callback_started.set()
+        await release_callback.wait()
+
+    monkeypatch.setattr(
+        arbiter_module,
+        "_SERVER_VAD_RESPONSE_STARTED_TIMEOUT",
+        0.01,
+    )
+    client = OmniRealtimeClient(
+        "wss://example.invalid/realtime",
+        "test-key",
+        model="gpt-4o-realtime-preview",
+        api_type="openai",
+        on_new_message=on_new_message,
+    )
+    socket = AsyncMock()
+    client.ws = socket
+    finish_stream = asyncio.Event()
+
+    async def message_stream():
+        yield json.dumps({"type": "input_audio_buffer.speech_stopped"})
+        yield json.dumps(
+            {"type": "response.created", "response": {"id": "resp-vad"}}
+        )
+        yield json.dumps(
+            {
+                "type": "response.done",
+                "response": {"id": "resp-vad", "status": "completed"},
+            }
+        )
+        await finish_stream.wait()
+
+    socket.__aiter__.side_effect = message_stream
+
+    receive_task = asyncio.create_task(client.handle_messages())
+    await callback_started.wait()
+    follow_up = await client._response_arbiter.enqueue(source="follow-up")
+
+    await asyncio.sleep(0.03)
+    assert follow_up.sent.done() is False
+    assert client._response_arbiter._server_vad_pending_handle is None
+
+    release_callback.set()
+    await asyncio.wait_for(follow_up.sent, 0.2)
+    client._response_arbiter.notify_response_created(
+        {"type": "response.created", "response": {"id": "resp-follow-up"}}
+    )
+    client._response_arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-follow-up", "status": "completed"},
+        }
+    )
+    await asyncio.wait_for(follow_up.done, 0.2)
+    finish_stream.set()
+    await receive_task
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_started_after_explicit_send_does_not_steal_owner():
+    sent = []
+
+    async def send(event):
+        sent.append(dict(event))
+
+    arbiter = RealtimeResponseArbiter(send)
+    proactive = await arbiter.enqueue(
+        source="proactive",
+        response_event={
+            "type": "response.create",
+            "event_id": "response-proactive",
+        },
+    )
+
+    await asyncio.wait_for(proactive.sent, 0.2)
+    # The explicit create has reached the server, but its response.created echo
+    # has not. Even if a VAD utterance starts and ends in that echo window, the
+    # already-sent explicit create still owns the next created event.
+    arbiter.notify_server_vad_started()
+    arbiter.notify_server_vad_response_pending()
+    arbiter.notify_response_created(
+        {
+            "type": "response.created",
+            "response": {"id": "resp-proactive"},
+        }
+    )
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-proactive", "status": "completed"},
+        }
+    )
+
+    await asyncio.wait_for(proactive.done, 0.2)
+    await arbiter.wait_until_idle(0.2)
+    assert proactive.started.exception() is None
+    assert arbiter._server_response_ids == {}
+    assert [event["type"] for event in sent] == ["response.create"]
+    await arbiter.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_vad_terminal_before_create_rejection_releases_failed_owner():
+    sent = []
+    aborted = []
+    arbiter = None
+
+    async def send(event):
+        sent.append(dict(event))
+        if event["type"] == "conversation.item.create":
+            arbiter.notify_response_created(
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp-vad"},
+                }
+            )
+            arbiter.notify_item_created(
+                {"item": {"id": "item-proactive", "role": "user"}}
+            )
+        elif event.get("event_id") == "response-proactive":
+            arbiter.notify_response_terminal(
+                {
+                    "type": "response.done",
+                    "response": {"id": "resp-vad"},
+                }
+            )
+            arbiter.notify_error(
+                "response-proactive",
+                "invalid_request_error: Conversation already has an active response",
+            )
+        elif event.get("event_id") == "response-follow-up":
+            arbiter.notify_response_created(
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp-follow-up"},
+                }
+            )
+
+    async def abort(reason):
+        aborted.append(reason)
+
+    arbiter = RealtimeResponseArbiter(send, abort_transport=abort)
+    proactive = await arbiter.enqueue(
+        source="proactive",
+        events_before_response=(
+            {
+                "type": "conversation.item.create",
+                "event_id": "item-event",
+                "item": {"id": "item-proactive", "role": "user"},
+            },
+        ),
+        response_event={
+            "type": "response.create",
+            "event_id": "response-proactive",
+        },
+        ack_expected=True,
+        expected_item_id="item-proactive",
+        expected_item_role="user",
+    )
+    follow_up = await arbiter.enqueue(
+        source="follow-up",
+        response_event={
+            "type": "response.create",
+            "event_id": "response-follow-up",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="active response"):
+        await asyncio.wait_for(proactive.done, 0.2)
+    await asyncio.wait_for(follow_up.sent, 0.2)
+
+    assert arbiter._response_owner is not None
+    assert arbiter._response_owner.ticket is follow_up
+    assert aborted == []
+
+    arbiter.notify_response_terminal(
+        {
+            "type": "response.done",
+            "response": {"id": "resp-follow-up"},
+        }
+    )
+    await asyncio.wait_for(follow_up.done, 0.2)
+    await arbiter.wait_until_idle(0.2)
+    await arbiter.shutdown()
 
 
 @pytest.mark.asyncio

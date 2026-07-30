@@ -12,47 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""StepFun realtime TTS worker."""
+"""Lanlan free-service realtime TTS worker."""
 
 from utils.tts.native_voice_registry import (
     make_native_tts_resolver,
     register_tts_worker_resolver,
 )
 
-from ._step_protocol import run_step_protocol_tts_worker
+from ._step_protocol import (
+    _adjust_free_tts_url,
+    _build_step_tts_create_data,
+    _get_tts_language_code,
+    run_step_protocol_tts_worker,
+)
 
 
-def step_realtime_tts_worker(
+def free_realtime_tts_worker(
     request_queue,
     response_queue,
     audio_api_key,
     voice_id,
-    free_mode=False,
 ):
-    # Compatibility for integrations that imported the historical combined
-    # worker and selected Lanlan with ``free_mode=True``. New registry routing
-    # uses the dedicated free worker directly, while this public call surface
-    # remains valid.
-    if free_mode:
-        from .free import free_realtime_tts_worker
-
-        free_realtime_tts_worker(
-            request_queue,
-            response_queue,
-            audio_api_key,
-            voice_id,
-        )
-        return
-    run_step_protocol_tts_worker(
+    return run_step_protocol_tts_worker(
         request_queue,
         response_queue,
         audio_api_key,
         voice_id,
-        provider_key="step",
+        provider_key="free",
     )
 
 
 register_tts_worker_resolver(
-    "step",
-    make_native_tts_resolver(step_realtime_tts_worker, "tts_default_api_key"),
+    "free",
+    make_native_tts_resolver(free_realtime_tts_worker, "tts_default_api_key"),
 )
+
+# free_intl uses the same Lanlan-owned streaming contract. Region routing inside
+# the worker selects www.lanlan.app and adds the required language_code.
+register_tts_worker_resolver(
+    "free_intl",
+    make_native_tts_resolver(free_realtime_tts_worker, "tts_default_api_key"),
+)
+
+
+__all__ = [
+    "free_realtime_tts_worker",
+    "_adjust_free_tts_url",
+    "_build_step_tts_create_data",
+    "_get_tts_language_code",
+]

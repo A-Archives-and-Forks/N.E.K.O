@@ -52,6 +52,11 @@ _SERVER_RESPONSE_ID_LIMIT = 32
 # idle-wait fail-close, which tears the connection down cleanly instead of
 # racing a known-live response.
 _DEFAULT_RESPONSE_DONE_TIMEOUT = 60.0
+# An automatic server-VAD response normally announces response.created almost
+# immediately after speech_stopped. Bound the id-less correlation gap so a
+# provider-side pre-creation failure cannot wedge the lane until the much
+# longer running-response timeout tears down an otherwise healthy connection.
+_SERVER_VAD_RESPONSE_STARTED_TIMEOUT = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,10 +101,16 @@ class _QueuedResponse:
     ticket: ResponseTicket = field(compare=False)
     item_ack: asyncio.Future[None] | None = field(default=None, compare=False)
     terminal: asyncio.Future[None] | None = field(default=None, compare=False)
+    terminal_error: BaseException | None = field(default=None, compare=False)
     response_id: str | None = field(default=None, compare=False)
     event_ids: frozenset[str] = field(default_factory=frozenset, compare=False)
     completed: asyncio.Future[None] | None = field(default=None, compare=False)
     bypass_count: int = field(default=0, compare=False)
+    response_send_started: bool = field(default=False, compare=False)
+    server_vad_won_during_response_send: bool = field(
+        default=False,
+        compare=False,
+    )
     interrupted: bool = field(default=False, compare=False)
     interrupt_event: asyncio.Event = field(
         default_factory=asyncio.Event,
@@ -125,11 +136,18 @@ class RealtimeResponseArbiter:
         self._send_event = send_event
         self._abort_transport = abort_transport
         self._queue: asyncio.PriorityQueue[_QueuedResponse] = asyncio.PriorityQueue()
+        self._queued_by_ticket: dict[int, _QueuedResponse] = {}
         self._sequence = itertools.count()
         self._worker: asyncio.Task[None] | None = None
         self._current: _QueuedResponse | None = None
         self._response_owner: _QueuedResponse | None = None
         self._server_response_active = False
+        # An ended server-VAD utterance identifies an automatic response that
+        # may race an explicit owner's response.create.  speech_started alone
+        # is not sufficient: an already-sent explicit create can still emit
+        # the next response.created while the user is only beginning to speak.
+        self._server_vad_response_pending = False
+        self._server_vad_pending_handle: asyncio.TimerHandle | None = None
         # Bounded insertion-ordered map of live server-initiated response ids
         # to their creation loop time; see _SERVER_RESPONSE_ID_LIMIT and
         # _server_response_max_age. Created adds, terminal removes.
@@ -168,6 +186,7 @@ class RealtimeResponseArbiter:
             self._current is not None
             or self._response_owner is not None
             or self._server_response_active
+            or self._server_vad_response_pending
             or not self._queue.empty()
         )
 
@@ -239,6 +258,7 @@ class RealtimeResponseArbiter:
             event_ids=frozenset(ids),
             completed=loop.create_future(),
         )
+        self._queued_by_ticket[id(ticket)] = queued
         await self._queue.put(queued)
         self._ensure_worker()
         return ticket
@@ -286,6 +306,48 @@ class RealtimeResponseArbiter:
         except asyncio.TimeoutError as original_timeout:
             await self._fail_closed("response cancellation terminal event timed out")
             raise original_timeout
+
+    async def cancel_ticket(
+        self,
+        ticket: ResponseTicket,
+        timeout: float = 3.0,
+        *,
+        wait: bool = True,
+    ) -> bool:
+        """Cancel one exact request; return whether cancellation was requested."""
+
+        queued = self._queued_by_ticket.get(id(ticket))
+        if queued is None:
+            return False
+        # The receive loop resolves ``terminal`` synchronously, while the
+        # worker removes the ticket on its next turn.  Cancellation in that
+        # narrow window must be a no-op: an unscoped response.cancel could
+        # otherwise hit a newer server-initiated response, and marking the
+        # completed ticket interrupted would turn its successful result into
+        # a cancellation error.
+        if queued.terminal is not None and queued.terminal.done():
+            return False
+        queued.interrupted = True
+        queued.interrupt_event.set()
+        # A ticket still waiting in the priority queue will observe the
+        # interrupt before dispatch. Do not cancel the unrelated current owner.
+        if queued is not self._current:
+            return True
+        if (
+            ticket.sent.done()
+            and not ticket.sent.cancelled()
+            and ticket.sent.exception() is None
+        ):
+            await self._send_event({"type": "response.cancel"})
+        if not wait:
+            return True
+        assert queued.completed is not None
+        try:
+            await asyncio.wait_for(asyncio.shield(queued.completed), timeout)
+        except asyncio.TimeoutError as original_timeout:
+            await self._fail_closed("targeted response cancellation timed out")
+            raise original_timeout
+        return True
 
     async def wait_until_idle(self, timeout: float | None = None) -> None:
         waiter = self._idle.wait()
@@ -339,6 +401,34 @@ class RealtimeResponseArbiter:
         if handle is not None:
             handle.cancel()
 
+    def _cancel_server_vad_pending_timer(self) -> None:
+        handle, self._server_vad_pending_handle = (
+            self._server_vad_pending_handle,
+            None,
+        )
+        if handle is not None:
+            handle.cancel()
+
+    def _arm_server_vad_pending_timer(self) -> None:
+        self._cancel_server_vad_pending_timer()
+        self._server_vad_pending_handle = asyncio.get_running_loop().call_later(
+            _SERVER_VAD_RESPONSE_STARTED_TIMEOUT,
+            self._server_vad_pending_expired,
+        )
+
+    def _server_vad_pending_expired(self) -> None:
+        self._server_vad_pending_handle = None
+        if not self._server_vad_response_pending:
+            return
+        self._server_vad_response_pending = False
+        logger.warning(
+            "released pending server-VAD response with no response.created "
+            "after %.1fs",
+            _SERVER_VAD_RESPONSE_STARTED_TIMEOUT,
+        )
+        if self._response_owner is None:
+            self._release_lane_if_clear()
+
     def _arm_stale_release_timer(self) -> None:
         """(Re)start the timer that re-checks the lane at the next staleness deadline."""
 
@@ -367,6 +457,14 @@ class RealtimeResponseArbiter:
         healthy connection, so past that bound its id stops holding the lane.
         """
 
+        if self._server_vad_response_pending:
+            # speech_stopped announces an automatic response before its
+            # response.created event supplies an id. Keep dispatch closed in
+            # that correlation gap; otherwise an explicit response.create can
+            # steal the next created event and leave its own ticket unresolved.
+            self._server_response_active = True
+            self._idle.clear()
+            return
         now = asyncio.get_running_loop().time()
         stale = [
             response_id
@@ -401,6 +499,13 @@ class RealtimeResponseArbiter:
     def notify_response_created(self, event: dict[str, Any]) -> None:
         self._server_response_active = True
         self._idle.clear()
+        if self._server_vad_response_pending:
+            self._cancel_server_vad_pending_timer()
+            self._server_vad_response_pending = False
+            response_id = self._event_response_id(event)
+            if response_id is not None:
+                self._remember_server_response_id(response_id)
+            return
         owner = self._response_owner
         if owner is not None and not owner.ticket.started.done():
             # The first response.created after the owner's response.create is
@@ -419,9 +524,84 @@ class RealtimeResponseArbiter:
         if response_id is not None:
             self._remember_server_response_id(response_id)
 
+    def notify_server_vad_started(self) -> None:
+        """Deliberately leave ownership unchanged until speech_stopped.
+
+        The transport keeps this explicit boundary so future callers do not
+        accidentally treat speech_started as evidence of an automatic
+        response; only the ended utterance below may arm that correlation.
+        """
+
+    def notify_server_vad_response_pending(
+        self,
+        *,
+        arm_timeout: bool = True,
+    ) -> None:
+        """Mark a VAD response pending unless an explicit create won the race."""
+
+        owner = self._response_owner
+        if owner is not None and owner.ticket.sent.done():
+            # The explicit response.create finished sending before this
+            # utterance ended. Its response.created echo can still be next;
+            # do not let the later VAD boundary steal that owner.
+            return
+        if (
+            owner is not None
+            and owner.response_send_started
+            and not owner.ticket.sent.done()
+        ):
+            # The automatic user turn won while response.create was inside an
+            # awaited transport write. The create may still reach the server,
+            # so quarantine it as a server response after the write returns;
+            # meanwhile the pending marker owns the next response.created.
+            owner.server_vad_won_during_response_send = True
+            owner.interrupted = True
+            owner.interrupt_event.set()
+        current = self._current
+        if owner is None and current is not None:
+            # The automatic user response won while an explicit request was
+            # still persisting its pre-response item or waiting for its ack.
+            # Stop that request before it can emit response.create; otherwise
+            # its first response.created echo is indistinguishable from the
+            # pending VAD response and can be credited to the wrong turn.
+            current.interrupted = True
+            current.interrupt_event.set()
+            if current.item_ack is not None and not current.item_ack.done():
+                current.item_ack.set_exception(
+                    RuntimeError(
+                        "response dispatch interrupted by pending server VAD response"
+                    )
+                )
+        self._server_vad_response_pending = True
+        self._server_response_active = True
+        self._idle.clear()
+        if arm_timeout:
+            self._arm_server_vad_pending_timer()
+
+    def arm_server_vad_response_pending_timeout(self) -> None:
+        """Start the missing-created backstop after receive handling resumes."""
+
+        if (
+            self._server_vad_response_pending
+            and self._server_vad_pending_handle is None
+        ):
+            self._arm_server_vad_pending_timer()
+
     def notify_response_terminal(self, event: dict[str, Any] | None = None) -> None:
         owner = self._response_owner
         response_id = self._event_response_id(event)
+        response = (event or {}).get("response")
+        response_status = (
+            str(response.get("status") or "").strip().lower()
+            if isinstance(response, dict)
+            else ""
+        )
+        terminal_error = (
+            RuntimeError(f"response.done status={response_status}")
+            if response_status
+            and response_status not in {"completed", "success", "succeeded"}
+            else None
+        )
         if owner is not None and response_id is not None:
             if not owner.ticket.started.done():
                 # The owner has not seen its response.created yet, and a
@@ -430,6 +610,14 @@ class RealtimeResponseArbiter:
                 # (server-initiated) response. Keep waiting for the owner's
                 # own lifecycle instead of failing it.
                 self._server_response_ids.pop(response_id, None)
+                if not self._server_response_ids:
+                    # The separately tracked server turn has ended. The
+                    # pending owner still holds dispatch serialization, but a
+                    # later response.create rejection must be able to detach
+                    # it instead of mistaking this already-terminal turn for
+                    # a live id-less response.
+                    self._cancel_stale_release_timer()
+                    self._server_response_active = False
                 return
             if owner.response_id is not None:
                 if response_id != owner.response_id:
@@ -455,6 +643,12 @@ class RealtimeResponseArbiter:
                     RuntimeError("response terminated before response.created")
                 )
             if owner.terminal is not None and not owner.terminal.done():
+                # A terminal event always resolves the lifecycle waiter,
+                # including an acknowledged response.cancel. Keep the
+                # response outcome separate so cancellation/timeout cleanup
+                # does not mistake a non-success terminal for a missing
+                # terminal and fail-close a healthy connection.
+                owner.terminal_error = terminal_error
                 owner.terminal.set_result(None)
             self._response_owner = None
         # The owner (if any) has terminated; the lane opens only once no
@@ -504,7 +698,10 @@ class RealtimeResponseArbiter:
         create, so the lane must not reopen on it.
         """
 
-        if not target.ticket.sent.done() or not event_id:
+        if (
+            not target.response_send_started
+            and not target.ticket.sent.done()
+        ) or not event_id:
             return False
         create_event_id = target.response_event.get("event_id")
         return event_id != (str(create_event_id) if create_event_id else None)
@@ -578,7 +775,9 @@ class RealtimeResponseArbiter:
         # the failed connection and complete its selected ticket.
         self._dispatch_allowed.set()
         self._server_response_active = False
+        self._server_vad_response_pending = False
         self._server_response_ids.clear()
+        self._cancel_server_vad_pending_timer()
         self._cancel_stale_release_timer()
         exc = ConnectionError(reason)
         owner = self._response_owner
@@ -604,6 +803,8 @@ class RealtimeResponseArbiter:
         self._connection_available = True
         self._dispatch_allowed.set()
         self._server_response_ids.clear()
+        self._server_vad_response_pending = False
+        self._cancel_server_vad_pending_timer()
         self._cancel_stale_release_timer()
         if self._current is None and self._response_owner is None:
             self._server_response_active = False
@@ -635,6 +836,7 @@ class RealtimeResponseArbiter:
             except asyncio.QueueEmpty:
                 return
             self._fail_ticket(queued.ticket, exc)
+            self._queued_by_ticket.pop(id(queued.ticket), None)
             if queued.completed is not None and not queued.completed.done():
                 queued.completed.set_result(None)
             self._queue.task_done()
@@ -771,10 +973,19 @@ class RealtimeResponseArbiter:
                 raise RuntimeError("response dispatch interrupted")
             if not self._connection_available:
                 raise ConnectionError("realtime connection is unavailable")
+            if queued.ticket.started.done():
+                if queued.ticket.started.cancelled():
+                    raise RuntimeError(
+                        "response dispatch rejected before response.create"
+                    )
+                pre_response_error = queued.ticket.started.exception()
+                if pre_response_error is not None:
+                    raise pre_response_error
             if self._response_owner is not None:
                 raise RuntimeError("response owner is already assigned")
             queued.terminal = loop.create_future()
             self._response_owner = queued
+            queued.response_send_started = True
             try:
                 await self._send_event(queued.response_event)
             except Exception:
@@ -783,6 +994,40 @@ class RealtimeResponseArbiter:
                 if not queued.terminal.done():
                     queued.terminal.cancel()
                 raise
+            if queued.server_vad_won_during_response_send:
+                # The possibly-live explicit create is now indistinguishable
+                # from a server response. Detach its ticket without cancelling
+                # the user's pending VAD response; pending/remembered server
+                # lifecycle state keeps the lane closed until all live work
+                # reaches a terminal event.
+                provider_error = (
+                    queued.ticket.started.exception()
+                    if queued.ticket.started.done()
+                    and not queued.ticket.started.cancelled()
+                    else None
+                )
+                if self._response_owner is queued:
+                    self._response_owner = None
+                if not queued.terminal.done():
+                    queued.terminal.cancel()
+                if provider_error is not None:
+                    raise provider_error
+                raise RuntimeError(
+                    "response dispatch interrupted by pending server VAD response"
+                )
+            if queued.interrupted:
+                await self._send_event({"type": "response.cancel"})
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(queued.terminal), queued.cancel_timeout
+                    )
+                except Exception:
+                    if not queued.terminal.done():
+                        queued.terminal.cancel()
+                    await self._fail_closed(
+                        "interrupted response could not reach a terminal state"
+                    )
+                raise RuntimeError("response dispatch interrupted")
             if not queued.ticket.sent.done():
                 queued.ticket.sent.set_result(None)
 
@@ -802,6 +1047,8 @@ class RealtimeResponseArbiter:
 
             if queued.interrupted:
                 raise RuntimeError("response dispatch interrupted")
+            if queued.terminal_error is not None:
+                raise queued.terminal_error
 
             result = ResponseDispatchResult(
                 item_acknowledged=item_acked,
@@ -814,14 +1061,34 @@ class RealtimeResponseArbiter:
         finally:
             if self._current is queued:
                 self._current = None
-            if self._response_owner is queued and not self._server_response_active:
-                self._response_owner = None
+            if self._response_owner is queued:
+                started_failed = (
+                    queued.ticket.started.done()
+                    and not queued.ticket.started.cancelled()
+                    and queued.ticket.started.exception() is not None
+                )
+                if not self._server_response_active or (
+                    started_failed and self._server_response_ids
+                ):
+                    # A response.create rejected before response.created owns
+                    # no live response. Detach it even when a server-VAD
+                    # response started during the preceding item-ack wait.
+                    # The separately remembered server response id continues
+                    # holding the lane until its own terminal event. For an
+                    # id-less server response, retain the owner as the only
+                    # safe terminal correlation instead of reopening early.
+                    self._response_owner = None
+                    if queued.terminal is not None and not queued.terminal.done():
+                        queued.terminal.cancel()
+                    self._release_lane_if_clear()
             if (
                 not requeued
                 and queued.completed is not None
                 and not queued.completed.done()
             ):
                 queued.completed.set_result(None)
+            if not requeued:
+                self._queued_by_ticket.pop(id(queued.ticket), None)
             if not self._server_response_active:
                 self._idle.set()
 
