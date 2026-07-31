@@ -593,6 +593,257 @@ class FactStore:
         logger.info(f"[FactStore] {name}: 归档 {len(to_archive)} 条已吸收的旧 facts，剩余 {len(facts)} 条")
         return len(to_archive)
 
+    # ── scoped subject archival (time-driven, 群记忆系列 5/7) ────────
+
+    def _archive_subject_facts(
+        self, name: str, subject: MemorySubject, archived_at_iso: str,
+        stale_cutoff: datetime,
+    ) -> int | None:
+        """Move the stale facts of one scoped subject into facts_archive.json.
+
+        Returns the number of rows stamped, or ``None`` when the pass ABORTED
+        because a fresh write revealed the subject just revived — the caller
+        must treat None as "subject is active again" and skip the subject's
+        remaining stores, not as an ordinary zero-count result.
+
+        Also stamps ``subject_archived_at`` onto the subject's rows that the
+        absorbed-shrink path had ALREADY moved into facts_archive.json: those
+        rows stay recallable by design for live subjects, so without the
+        in-place stamp an archived subject would remain searchable through
+        its absorbed history forever.
+
+        Time-driven counterpart of `_archive_absorbed` (score/absorbed-driven).
+        Every moved row is stamped with ``subject_archived_at`` — the marker
+
+          * excludes the row from both recall paths' archive pool
+            (`hybrid_recall._aload_archive_facts` filters on it), unlike
+            absorbed-archived rows which stay recallable by design;
+          * excludes the row from the FTS near-dup guard in
+            `_apersist_new_facts_locked`, so a revived subject re-stating an
+            archived fact lands a NEW active fact instead of being silently
+            deduped into invisibility;
+          * is what `_restore_subject_facts` strips when moving rows back.
+
+        ``stale_cutoff`` re-validates the sweep's staleness snapshot UNDER
+        the write lock: a fact written (or explicitly restored — the
+        ``restored_at`` stamp counts like the ledger does) between the
+        sweep's judgement and this call has a timestamp ``>= cutoff`` — the
+        subject just revived, so the whole archival aborts (returning
+        ``None``) rather than sweeping the subject's first fresh memory out
+        of recall. Rows with unparseable timestamps never archive (unknown
+        age must not mean "old"), but also never veto the pass — one
+        corrupt row must not immortalize the subject. A corrupt archive
+        file likewise aborts with ``None``: proceeding would leave the
+        subject permanently split (facts active, higher stores archived).
+
+        Same two-file commit discipline as `_archive_absorbed`: archive first,
+        facts.json second — an interruption leaves the row in BOTH files
+        (readers converge by id, next run is idempotent), never in neither.
+        """
+        self.load_facts(name)  # ensure cache before taking the lock (non-reentrant)
+        with self._get_lock(name):
+            assert_cloudsave_writable(
+                self._config_manager,
+                operation="archive",
+                target=f"memory/{name}/facts.json",
+            )
+            facts = self._facts.get(name, [])
+            matching = [
+                f for f in facts
+                if isinstance(f, dict) and entry_matches_subject(f, subject)
+            ]
+            to_archive: list[dict] = []
+            for f in matching:
+                # 复活检查同时看 created_at 与 restored_at：判定窗口内的
+                # 显式 restore 给行盖的是 restored_at（created_at 仍是旧
+                # 值），只看 created_at 会把刚恢复的行立刻再归档。
+                latest: datetime | None = None
+                for field in ('created_at', 'restored_at'):
+                    try:
+                        parsed = datetime.fromisoformat(f.get(field) or '')
+                    except (ValueError, TypeError):
+                        continue
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.astimezone().replace(tzinfo=None)
+                    if latest is None or parsed > latest:
+                        latest = parsed
+                if latest is None:
+                    continue  # 未知年龄的行留在活跃池（对齐 _archive_absorbed）
+                if latest >= stale_cutoff:
+                    # 判定后落进来的新写入/恢复：subject 已复活，本轮整体
+                    # 中止。新写入只会落在活跃池，归档池里的行都早于判定
+                    # 快照，所以复活检查只需要看活跃行。
+                    logger.info(
+                        f"[FactStore] {name}: subject "
+                        f"[scoped {subject.kind}/{subject.subject_id}] 在归档窗口"
+                        f"内有新写入，中止本轮 subject 归档"
+                    )
+                    return None
+                to_archive.append(f)
+            archive_path = self._facts_archive_path(name)
+            existing_archive: list[dict] = []
+            if os.path.exists(archive_path):
+                try:
+                    with open(archive_path, encoding='utf-8') as fh:
+                        data = json.load(fh)
+                    if not isinstance(data, list):
+                        logger.warning(
+                            f"[FactStore] {name}: 归档文件顶层不是列表，"
+                            "中止本轮 subject 归档"
+                        )
+                        return None
+                    existing_archive = data
+                except (json.JSONDecodeError, OSError) as e:
+                    # 归档文件损坏时按中止（None）而非普通零结果返回：让
+                    # caller 跳过 reflection/persona——否则每轮都在同一处
+                    # 失败，subject 永久劈叉成「facts 活跃、高层已归档」。
+                    logger.warning(
+                        f"[FactStore] {name}: 读取归档文件失败，中止本轮 subject 归档: {e}"
+                    )
+                    return None
+            # absorbed 收缩早已搬进归档文件的同 subject 行：就地补
+            # subject_archived_at 标记，让它们与活跃行一起退出召回。
+            stamped_in_archive = 0
+            for f in existing_archive:
+                if (
+                    isinstance(f, dict)
+                    and not f.get('subject_archived_at')
+                    and entry_matches_subject(f, subject)
+                ):
+                    f['subject_archived_at'] = archived_at_iso
+                    stamped_in_archive += 1
+            if not to_archive and not stamped_in_archive:
+                return 0
+            stamped = []
+            for f in to_archive:
+                copy = dict(f)
+                copy['subject_archived_at'] = archived_at_iso
+                stamped.append(copy)
+            existing_archive = _merge_archive_entries(existing_archive, stamped)
+            atomic_write_json(archive_path, existing_archive, indent=2, ensure_ascii=False)
+            if to_archive:
+                active = [f for f in facts if id(f) not in {id(x) for x in to_archive}]
+                atomic_write_json(self._facts_path(name), active, indent=2, ensure_ascii=False)
+                # 缓存按身份原地剔除（并发 append 的行保留在缓存里，下次 save 落盘）。
+                archived_identities = {id(f) for f in to_archive}
+                facts[:] = [f for f in facts if id(f) not in archived_identities]
+            # 隐私口径：只打域标识与条数，不打原文。
+            logger.info(
+                f"[FactStore] {name}: subject 归档 [scoped {subject.kind}"
+                f"/{subject.subject_id}] 活跃 {len(to_archive)} 条 + 归档池补标记 "
+                f"{stamped_in_archive} 条"
+            )
+            return len(to_archive) + stamped_in_archive
+
+    async def aarchive_subject_facts(
+        self, name: str, subject: MemorySubject, archived_at_iso: str,
+        stale_cutoff: datetime,
+    ) -> int | None:
+        return await asyncio.to_thread(
+            self._archive_subject_facts, name, subject, archived_at_iso,
+            stale_cutoff,
+        )
+
+    def _restore_subject_facts(
+        self, name: str, subject: MemorySubject,
+        restored_at_iso: str | None = None,
+    ) -> int:
+        """Move a subject's ``subject_archived_at`` rows back into facts.json.
+
+        Inverse of `_archive_subject_facts`; absorbed-archived rows (no
+        marker) are untouched. Write order is the mirror image — facts.json
+        (with the restored rows) first, archive (without them) second — so an
+        interruption again leaves rows in BOTH files, and every reader's
+        by-id convergence keeps the active copy.
+
+        Every restored row is stamped with ``restored_at``: the staleness
+        ledger counts it as a write (see ``subject_archive._TIMESTAMP_FIELDS``),
+        so an explicit restore resets the subject's archival clock instead of
+        being undone by the very next sweep.
+
+        Returns the number of rows moved back, or ``None`` when the archive
+        file is corrupt — mirroring the archival side's abort semantics, so
+        the orchestrator skips the higher stores instead of leaving the
+        subject split (facts still archived, reflections/persona active).
+        A missing archive file is an ordinary no-op 0.
+        """
+        if restored_at_iso is None:
+            restored_at_iso = datetime.now().isoformat()
+        self.load_facts(name)
+        with self._get_lock(name):
+            assert_cloudsave_writable(
+                self._config_manager,
+                operation="save",
+                target=f"memory/{name}/facts.json",
+            )
+            archive_path = self._facts_archive_path(name)
+            if not os.path.exists(archive_path):
+                return 0
+            try:
+                with open(archive_path, encoding='utf-8') as fh:
+                    archived = json.load(fh)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(
+                    f"[FactStore] {name}: 读取归档文件失败，中止 subject 恢复: {e}"
+                )
+                return None
+            if not isinstance(archived, list):
+                logger.warning(
+                    f"[FactStore] {name}: 归档文件顶层非 list，中止 subject 恢复"
+                )
+                return None
+
+            def _is_subject_archived_row(f) -> bool:
+                return (
+                    isinstance(f, dict)
+                    and f.get('subject_archived_at')
+                    and entry_matches_subject(f, subject)
+                )
+
+            to_restore = [f for f in archived if _is_subject_archived_row(f)]
+            if not to_restore:
+                return 0
+            facts = self._facts.get(name, [])
+            active_ids = {
+                fid for fid in (
+                    _readable_fact_id(f) for f in facts if isinstance(f, dict)
+                ) if fid is not None
+            }
+            restored: list[dict] = []
+            for f in to_restore:
+                fid = _readable_fact_id(f)
+                if fid is not None and fid in active_ids:
+                    # 上次恢复被打断留下的「两边都有」：active 赢，归档副本
+                    # 直接收敛掉即可。
+                    continue
+                copy = dict(f)
+                copy.pop('subject_archived_at', None)
+                copy['restored_at'] = restored_at_iso
+                restored.append(copy)
+            remaining_archive = [
+                f for f in archived if not _is_subject_archived_row(f)
+            ]
+            atomic_write_json(
+                self._facts_path(name), facts + restored, indent=2, ensure_ascii=False,
+            )
+            atomic_write_json(
+                archive_path, remaining_archive, indent=2, ensure_ascii=False,
+            )
+            facts.extend(restored)
+            logger.info(
+                f"[FactStore] {name}: subject 恢复 [scoped {subject.kind}"
+                f"/{subject.subject_id}] {len(restored)} 条 facts 回活跃池"
+            )
+            return len(restored)
+
+    async def arestore_subject_facts(
+        self, name: str, subject: MemorySubject,
+        restored_at_iso: str | None = None,
+    ) -> int | None:
+        return await asyncio.to_thread(
+            self._restore_subject_facts, name, subject, restored_at_iso,
+        )
+
     # ── extraction ───────────────────────────────────────────────────
 
     @staticmethod
@@ -1555,7 +1806,16 @@ class FactStore:
                         hit = facts_by_id.get(fid)
                         if hit is None:
                             hit = (await _aarchived_by_id()).get(fid)
-                        if hit is None or not entry_matches_subject(hit, memory_subject):
+                        # subject 时间归档的行（subject_archived_at 标记）不算
+                        # 去重障碍：subject 复活时重述的旧事实必须能落新
+                        # active fact——归档行已退出召回与渲染，挡住重述等于
+                        # 让这条信息永久不可见。absorbed 归档行（无标记）仍
+                        # 照旧挡重复。
+                        if (
+                            hit is None
+                            or hit.get('subject_archived_at')
+                            or not entry_matches_subject(hit, memory_subject)
+                        ):
                             continue
                         same_subject_seen += 1
                         if same_subject_seen > 3:
