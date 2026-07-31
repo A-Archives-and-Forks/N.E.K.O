@@ -41,6 +41,8 @@ from config import (
     EXTERNAL_IMPORT_DAILY_MAX_CONCURRENCY,
     EXTERNAL_IMPORT_DAILY_MAX_FILES,
     MEMORY_SCHEMA_VERSION_CURRENT,
+    SCOPED_HISTORY_BATCH_CONTENT_MAX_TOKENS,
+    SCOPED_HISTORY_PER_MESSAGE_MAX_TOKENS,
     SCOPED_BATCH_SEGMENT_NONCE_BYTES,
 )
 from memory.temporal import (
@@ -50,6 +52,7 @@ from memory.temporal import (
 from config.prompts.prompts_memory import (
     get_fact_extraction_batch_prompt,
     get_fact_extraction_prompt,
+    get_scoped_batch_middle_omission_marker,
     get_signal_detection_prompt,
 )
 from memory.evidence import evidence_score
@@ -895,7 +898,180 @@ class FactStore:
         return ' '.join(text.split())[:64].strip()
 
     @classmethod
-    def _format_speaker_segments(cls, segments: list[dict], *, nonce: str) -> str:
+    def _cap_speaker_message_bodies(
+        cls,
+        segments: list[dict],
+        *,
+        omission_marker: str,
+    ) -> list[list[str]]:
+        """Apply per-message and whole-batch token budgets to prompt text.
+
+        Short messages are returned byte-for-byte unchanged. Long messages
+        keep both ends, and an over-budget batch shares its remaining content
+        budget fairly so late segments cannot be starved by earlier ones.
+        """
+        from utils.tokenize import count_tokens, truncate_head_tail_tokens
+
+        omission_tokens = count_tokens(omission_marker)
+
+        raw_by_segment: list[list[str]] = []
+        flat_raw: list[str] = []
+        flat_separator_costs: list[int] = []
+        for segment in segments:
+            segment_bodies = []
+            for message_index, msg in enumerate(segment.get('messages') or []):
+                body = cls._SEGMENT_MARKER_LITERAL.sub(
+                    '［SEGMENT',
+                    cls._flatten_message_content(getattr(msg, 'content', '')),
+                )
+                segment_bodies.append(body)
+                flat_raw.append(body)
+                flat_separator_costs.append(
+                    count_tokens("\n") if message_index else 0
+                )
+            raw_by_segment.append(segment_bodies)
+
+        def _rendered_cost(body: str) -> int:
+            body_lines = body.splitlines() or ['']
+            rendered_lines = [f"> {body_lines[0]}"]
+            rendered_lines.extend(f"| {line}" for line in body_lines[1:])
+            return count_tokens("\n".join(rendered_lines))
+
+        def _clip(body: str, budget: int) -> str:
+            if budget <= 0:
+                return ''
+
+            # Tokenizers can be pathologically slow on a single enormous run
+            # (for example hundreds of thousands of repeated ASCII chars).
+            # This is a CPU guard, not the prompt contract: the final output is
+            # still governed by token budgets below and keeps both ends plus a
+            # visible marker. The generous factor avoids touching ordinary
+            # prose while bounding what any tokenizer invocation receives.
+            working_char_limit = (
+                SCOPED_HISTORY_PER_MESSAGE_MAX_TOKENS * 16
+            )
+            if len(body) > working_char_limit:
+                guard_head = working_char_limit // 2
+                guard_tail = working_char_limit - guard_head
+                guarded = (
+                    f"{body[:guard_head]}{omission_marker}{body[-guard_tail:]}"
+                )
+                if _rendered_cost(guarded) <= budget:
+                    return guarded
+                body = f"{body[:guard_head]}{body[-guard_tail:]}"
+            elif _rendered_cost(body) <= budget:
+                return body
+
+            # Bound the working set once before binary search. Otherwise each
+            # probe would re-encode the complete untrusted body. An empty
+            # separator deliberately joins the retained ends only internally;
+            # the final probe below inserts the visible localized marker.
+            working_budget = min(
+                SCOPED_HISTORY_PER_MESSAGE_MAX_TOKENS,
+                budget,
+            )
+            working_head = working_budget // 2
+            working_body = truncate_head_tail_tokens(
+                body,
+                working_head,
+                working_budget - working_head,
+                separator='',
+            )
+            working_was_truncated = working_body != body
+
+            # The budget covers the generated per-line ``| `` prefix too.
+            # Binary-search the largest content allocation whose fully
+            # rendered form fits; this closes the newline-dense amplification
+            # path without discarding either retained end.
+            low = 0
+            high = min(SCOPED_HISTORY_PER_MESSAGE_MAX_TOKENS, budget)
+            if working_was_truncated:
+                # Force the final pass to insert the visible marker instead
+                # of accepting the internal marker-less working set as-is.
+                high = min(high, max(0, count_tokens(working_body) - 1))
+            best = ''
+            while low <= high:
+                content_budget = (low + high) // 2
+                retained_budget = max(0, content_budget - omission_tokens)
+                head = retained_budget // 2
+                candidate = truncate_head_tail_tokens(
+                    working_body,
+                    head + omission_tokens,
+                    retained_budget - head,
+                    separator=omission_marker,
+                )
+                if _rendered_cost(candidate) <= budget:
+                    best = candidate
+                    low = content_budget + 1
+                else:
+                    high = content_budget - 1
+            return best
+
+        individually_capped = [
+            _clip(body, SCOPED_HISTORY_PER_MESSAGE_MAX_TOKENS)
+            for body in flat_raw
+        ]
+        if (
+            sum(
+                _rendered_cost(body) + separator_cost
+                for body, separator_cost in zip(
+                    individually_capped,
+                    flat_separator_costs,
+                )
+            )
+            <= SCOPED_HISTORY_BATCH_CONTENT_MAX_TOKENS
+        ):
+            final_flat = individually_capped
+        else:
+            costs = [
+                _rendered_cost(body) + separator_cost
+                for body, separator_cost in zip(
+                    individually_capped,
+                    flat_separator_costs,
+                )
+            ]
+            allocations = [0] * len(costs)
+            remaining_budget = SCOPED_HISTORY_BATCH_CONTENT_MAX_TOKENS
+            active = list(range(len(costs)))
+            while active:
+                fair_share = remaining_budget // len(active)
+                satisfied = [index for index in active if costs[index] <= fair_share]
+                if satisfied:
+                    for index in satisfied:
+                        allocations[index] = costs[index]
+                        remaining_budget -= costs[index]
+                    satisfied_set = set(satisfied)
+                    active = [index for index in active if index not in satisfied_set]
+                    continue
+
+                bonus_count = remaining_budget % len(active)
+                for position, index in enumerate(active):
+                    allocations[index] = fair_share + (position < bonus_count)
+                break
+
+            final_flat = [
+                _clip(body, max(0, budget - separator_cost))
+                for body, budget, separator_cost in zip(
+                    flat_raw,
+                    allocations,
+                    flat_separator_costs,
+                )
+            ]
+
+        final_iter = iter(final_flat)
+        return [
+            [next(final_iter) for _ in segment_bodies]
+            for segment_bodies in raw_by_segment
+        ]
+
+    @classmethod
+    def _format_speaker_segments(
+        cls,
+        segments: list[dict],
+        *,
+        nonce: str,
+        lang: str = "en",
+    ) -> str:
         """Render multi-speaker segments for the batch extraction prompt.
 
         段首标记 ``[SEGMENT n:nonce | speaker: label]`` 是 locale 无关的固定
@@ -910,12 +1086,14 @@ class FactStore:
            "| ［SEGMENT 2 | ...]"，明确落在自己那段里。按 ``splitlines()``
            切，覆盖 \\r / \\x85 / U+2028 这些同样会被渲染成换行的分隔符。
 
-           续行用的是**短标记**而不是重复整条 label：label 可以到 64 字符，
+           正文每行用的是**短标记**而不是重复整条 label：label 可以到 64 字符，
            而消息里的换行数不受任何上游限制（路由只数消息条数、群名片也
            没有长度校验），逐行重复 label 等于给攻击者一个 ~67 倍的放大器
            ——一条几千行的消息就能把 prompt 撑爆或耗光抽取超时，而失败的
-           批是保留重试的，同批其他成员会被一起拖住（Codex）。短标记把
-           放大压到每行 2 字节，防伪性质不变：行首不是段首形状就够了。
+           批是保留重试的，同批其他成员会被一起拖住（Codex）。发言人已在
+           段首唯一标明；消息首行用 ``> ``、续行用 ``| ``，既保留消息边界，
+           又把固定开销压到每行 2 字节。这些生成前缀也计入 batch token
+           预算，避免换行密集正文再次放大。
         2. **段首带一次性 nonce**——攻击者的消息在 nonce 生成之前就写死了，
            猜不到本次请求的 token，伪造头与真段首形状对不上。
         3. **label 与正文里的结构字面量中和**——label 剥方括号/竖线/换行，
@@ -923,18 +1101,21 @@ class FactStore:
 
         nonce 只用于渲染侧的边界防伪，**不要求模型原样回吐**（归属输出仍是
         段号整数）——让模型复述 token 只会凭空增加它出错的面。"""  # noqa: DOCSTRING_CJK
+        omission_marker = get_scoped_batch_middle_omission_marker(lang)
+        capped_bodies = cls._cap_speaker_message_bodies(
+            segments,
+            omission_marker=omission_marker,
+        )
         blocks = []
-        for index, segment in enumerate(segments, start=1):
+        for index, (segment, message_bodies) in enumerate(
+            zip(segments, capped_bodies),
+            start=1,
+        ):
             label = cls.sanitize_speaker_label(segment.get('speaker_label'))
             lines = [f"[SEGMENT {index}:{nonce} | speaker: {label}]"]
-            for msg in segment.get('messages') or []:
-                body = cls._SEGMENT_MARKER_LITERAL.sub(
-                    '［SEGMENT',
-                    cls._flatten_message_content(getattr(msg, 'content', '')),
-                )
+            for body in message_bodies:
                 body_lines = body.splitlines() or ['']
-                lines.append(f"{label} | {body_lines[0]}")
-                # 续行只冠短标记：同一条消息的后续行，发言人显然没变。
+                lines.append(f"> {body_lines[0]}")
                 lines.extend(f"| {line}" for line in body_lines[1:])
             blocks.append("\n".join(lines))
         return "\n\n".join(blocks)
@@ -1111,14 +1292,18 @@ class FactStore:
         二次替换（后者尤其重要——那等于让攻击者把 nonce 印进自己的正文）。"""  # noqa: DOCSTRING_CJK
         # 一次性段边界 token：攻击者的消息在它生成之前就写死了，猜不到。
         nonce = secrets.token_hex(SCOPED_BATCH_SEGMENT_NONCE_BYTES)
+        lang = get_global_language_full()
+        rendered_segments = await asyncio.to_thread(
+            self._format_speaker_segments,
+            segments,
+            nonce=nonce,
+            lang=lang,
+        )
         prompt = (
-            get_fact_extraction_batch_prompt(get_global_language_full())
+            get_fact_extraction_batch_prompt(lang)
             .replace('{LANLAN_NAME}', lanlan_name)
             .replace('{SEGMENT_NONCE}', nonce)
-            .replace(
-                '{SEGMENTS}',
-                self._format_speaker_segments(segments, nonce=nonce),
-            )
+            .replace('{SEGMENTS}', rendered_segments)
         )
         extracted = await self._allm_call_with_retries(
             prompt, lanlan_name,
@@ -1437,19 +1622,6 @@ class FactStore:
         """  # noqa: DOCSTRING_CJK
         if not segments:
             return []
-        if len(segments) == 1:
-            # 单段无归属风险：走成熟的单发抽取管线（prompt 更完整、
-            # malformed 判定也更严）。
-            segment = segments[0]
-            created = await self.extract_facts(
-                segment.get('messages') or [],
-                lanlan_name,
-                subject=segment.get('subject'),
-                fail_closed=True,
-                speaker_label=segment.get('speaker_label'),
-                speaker_provenance=self._speaker_provenance_of(segment),
-            )
-            return [{'status': 'ok', 'created': created, 'dropped': 0}]
 
         extracted = await self._allm_extract_facts_batch(lanlan_name, segments)
         if extracted is None:
