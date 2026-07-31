@@ -44,6 +44,9 @@ import pytest
 from main_logic.omni_realtime_client import OmniRealtimeClient
 from main_logic.omni_realtime_client import _response_arbiter as _arbiter_module
 from main_logic.omni_realtime_client._response_arbiter import RealtimeResponseArbiter
+from main_logic.omni_realtime_client._shared import (
+    _IMAGE_ANALYSIS_PENDING_DESCRIPTION,
+)
 from main_logic.tool_calling import ToolResult
 
 
@@ -303,6 +306,84 @@ async def test_reconnect_restores_dispatch_for_a_native_client():
     assert [event["type"] for event in sent] == ["response.create"]
     _complete_turn(arbiter, "resp-1")
     await asyncio.wait_for(revived.done, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_terminal_resets_the_per_turn_output_state():
+    # The per-turn cleanup in the response.done handler had no coverage at
+    # all: deleting the whole block turned nothing red. It is worth pinning on
+    # its own — _image_sent_this_turn in particular, because a stale one makes
+    # stream_image withhold the NEXT turn's visual context for its whole
+    # duration, so that response answers about a screen it cannot see.
+    #
+    # It is also the safety net for the extraction this commit performs: a
+    # helper nobody tests can be moved wrong without anything noticing.
+    client = _native_client()
+    socket = _RecordingSocket()
+    client.ws = socket
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed({"type": "response.created", "response": {"id": "resp-1"}})
+    await _settle()
+    # Dirty the state AFTER response.created: that handler clears the
+    # transcript buffer itself, so seeding before it would leave this test
+    # asserting a value nobody had to produce. Every field the helper clears
+    # is seeded — a field left at its default makes its reset deletable
+    # without this test noticing.
+    client._audio_delta_count = 5
+    client._output_transcript_buffer = "leftover"
+    client._print_input_transcript = True
+    client._image_sent_this_turn = True
+    client._image_recognized_this_turn = True
+
+    socket.feed({"type": "response.done", "response": {"id": "resp-1"}})
+    await _settle()
+
+    assert client._audio_delta_count == 0
+    assert client._output_transcript_buffer == ""
+    assert client._print_input_transcript is False
+    assert client._image_sent_this_turn is False, (
+        "a stale image flag makes stream_image withhold the next turn's "
+        "visual context for its whole duration"
+    )
+    assert client._image_recognized_this_turn is False
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_terminal_rearms_analysis_on_a_non_native_image_provider():
+    # The helper has two branches and the case above only exercises one.
+    # Standard StepFun is the sole provider without native image input: it
+    # re-arms the pending sentinel instead, and only while the cached frame is
+    # absent or already consumed. Without this, the elif could be deleted
+    # wholesale and the suite would stay green.
+    client = _native_client(api_type="step", model="step-realtime")
+    assert client._supports_native_image is False, "this is the elif branch"
+    socket = _RecordingSocket()
+    client.ws = socket
+    receive_loop = asyncio.create_task(client.handle_messages())
+
+    socket.feed({"type": "response.created", "response": {"id": "resp-1"}})
+    await _settle()
+    client._image_recognized_this_turn = True
+    client._image_description = "an analysis from the turn being ended"
+    client._latest_image_b64 = None  # absent frame -> re-arm
+
+    socket.feed({"type": "response.done", "response": {"id": "resp-1"}})
+    await _settle()
+
+    assert client._image_recognized_this_turn is False
+    assert client._image_description == _IMAGE_ANALYSIS_PENDING_DESCRIPTION, (
+        "StepFun analyzes only while the sentinel is present, so ending a "
+        "turn with no cached frame has to re-arm it"
+    )
+
+    socket.finish()
+    await asyncio.wait_for(receive_loop, timeout=1)
 
 
 @pytest.mark.unit
