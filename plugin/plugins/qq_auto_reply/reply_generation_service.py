@@ -109,6 +109,11 @@ class QQReplyGenerationService:
                 stage_trace.status = "no_session"
                 return QQModelResult(reply_text=None, source="none", traces=[stage_trace])
 
+            # This evidence belongs to exactly one generation. Clear a
+            # previous turn before prime/streaming can fail and leave a stale
+            # truthy value for the delivery buffer to consume.
+            user_data["human_row_materialized"] = False
+
             user_session, reply_chunks = self.plugin.session_runtime_service.prime_generation_session_state(
                 user_data,
                 session_key=session_key,
@@ -179,6 +184,7 @@ class QQReplyGenerationService:
                 reply_text=ai_reply,
                 pre_tool_text=pre_tool_text,
                 source="session",
+                history_ai_row=user_data.get("current_turn_ai_row"),
                 traces=[stage_trace],
             )
 
@@ -259,6 +265,7 @@ class QQReplyGenerationService:
             # 根本没进历史——此时入 participant bucket 会造出会话里不存在的
             # 成员记忆。
             user_data["human_row_accepted"] = False
+            user_data["human_row_materialized"] = False
             reply_attempt_state = user_data.setdefault(
                 "reply_attempt_state", {"discard_epoch": 0},
             )
@@ -276,14 +283,14 @@ class QQReplyGenerationService:
 
             restore_session_prompt = self._apply_turn_memory_context(
                 user_session, turn_system_prompt, turn_recalled_text,
-                # 私聊会话的 prompt 是建会话时烙进去的：跨群授权打开时建的
-                # 那条里带着别的群/联系人的清单，opt-out 之后本轮虽然构建了
-                # 剥离版，不换上去 stream_text 用的还是旧的；而新 context 的
-                # cross_session_section 已被剥空，两道 consent 闸也看不出
-                # 依赖。开关关着时私聊也强制换。
+                # 私聊 participant 会话的 prompt 也是建会话时烙进去的：
+                # 当前轮召回为空不代表旧 prompt 里没有 scoped memory。
+                # 每轮都换成刚构建的 prompt，才能让生成内容与本轮依赖快照
+                # 对齐；restore 保证持久会话仍保留创建时的原始 system 行。
                 always_refresh=(
                     context.is_group
                     or bool(getattr(context, "cross_session_section", ""))
+                    or user_data.get("private_memory_mode") == "participant"
                     or not bool(
                         (getattr(self.plugin, "_qq_settings", {}) or {}).get(
                             "allow_cross_group_context", False,
@@ -399,9 +406,14 @@ class QQReplyGenerationService:
                     )
                     user_data["current_pre_tool_text"] = current_pre_tool_text
                 appended = list(history_now)[history_before:]
-                user_data["human_row_accepted"] = any(
+                human_row_materialized = any(
                     getattr(row, "type", "") == "human" for row in appended
                 )
+                user_data["human_row_accepted"] = human_row_materialized
+                # run_primary_session_call consumes human_row_accepted while
+                # recording group-member turns. Delivery happens afterward,
+                # so preserve separate evidence for reply buffering.
+                user_data["human_row_materialized"] = human_row_materialized
                 # 本轮真正写进历史的那条 ai 行（没有就是 None）。未投递打标
                 # 按它的身份来：用"raw 输出非空"去推断历史里有行，是推断而
                 # 不是证据——推断错了就会把上一条**已投递**的回复标成未投递，
@@ -411,15 +423,23 @@ class QQReplyGenerationService:
                      if getattr(row, "type", "") == "ai"),
                     None,
                 )
-                if context.is_group and not user_data.get("memory_enabled"):
-                    # 未授权边界在 finally 记：异常/空回复的 human 行也已
-                    # 进历史，只在成功路径记会漏（超时路径会话随后被弃，
-                    # 多记无害）。
-                    user_data["nonconsent_history_end"] = len(
-                        getattr(user_session, "_conversation_history", []) or []
-                    )
+                self._stamp_nonconsent_boundary(user_data, user_session)
 
             return "".join(reply_chunks)
+
+    @staticmethod
+    def _stamp_nonconsent_boundary(user_data: dict, user_session: Any) -> None:
+        """未授权边界在生成轮 finally 记（调用点在 run_primary_session_call）。
+
+        异常/空回复的 human 行也已进历史，只在成功路径记会漏（超时路径
+        会话随后被弃，多记无害）。私聊轮同样记（此前限定 is_group）：
+        participant 结算分支拿它当 digest 起点地板，OFF 时代的私聊行在
+        开关翻 ON 后绝不回溯入库；legacy admin 路径不读该字段，多记无害。
+        """  # noqa: DOCSTRING_CJK
+        if not user_data.get("memory_enabled"):
+            user_data["nonconsent_history_end"] = len(
+                getattr(user_session, "_conversation_history", []) or []
+            )
 
     def _arm_recall_tool(
         self,
@@ -702,6 +722,15 @@ class QQReplyGenerationService:
                 settings.get("allow_cross_group_context", False)
             )
         if not getattr(context, "is_group", False):
+            if getattr(context, "participant_memory_enabled", False) and (
+                getattr(context, "core_memory_text", "")
+                or getattr(context, "recalled_memory_text", "")
+            ):
+                # 私聊 participant 轮的 prompt 依赖该开关（对偶群轮的
+                # group_memory_enabled 记账）：发送前撤销复检要覆盖它。
+                snapshot["private_participant_memory_enabled"] = bool(
+                    settings.get("private_participant_memory_enabled", False)
+                )
             return snapshot
         if getattr(context, "core_memory_text", "") or getattr(
             context, "recalled_memory_text", "",
@@ -761,6 +790,16 @@ class QQReplyGenerationService:
                 system_prompt, getattr(context, "cross_session_section", "") or "",
             )
         if not getattr(context, "is_group", False):
+            if getattr(
+                context, "participant_memory_enabled", False,
+            ) and not settings.get("private_participant_memory_enabled", False):
+                # 私聊 participant 轮的授权在生成前被撤销：scoped 召回与
+                # bootstrap 段全部撤除（对偶下面群分支的撤法）。
+                recalled_text = ""
+                system_prompt = self._strip_section_text(
+                    system_prompt,
+                    getattr(context, "core_memory_text", "") or "",
+                )
             return system_prompt, recalled_text
         core_text = getattr(context, "core_memory_text", "") or ""
         if not settings.get("group_memory_enabled", False):
@@ -868,10 +907,15 @@ class QQReplyGenerationService:
 
         The primary session accepted the human row but produced nothing, so
         the fallback's text exists only in the outbound message: without
-        this the group digest persists a one-sided conversation and loses
+        this a scoped digest persists a one-sided conversation and loses
         whatever the bot disclosed. Idempotent — the row is tagged so a
         second delivery hook cannot double-append."""
-        if not getattr(context, "is_group", False) or not reply_text:
+        is_group = bool(getattr(context, "is_group", False))
+        is_participant = bool(
+            not is_group
+            and getattr(context, "participant_memory_enabled", False)
+        )
+        if not (is_group or is_participant) or not reply_text:
             return
         if getattr(context, "ephemeral_session", False):
             return
@@ -880,6 +924,11 @@ class QQReplyGenerationService:
             session_key
         )
         if not user_data or not user_data.get("memory_enabled"):
+            return
+        if (
+            is_participant
+            and user_data.get("private_memory_mode") != "participant"
+        ):
             return
         session = user_data.get("session")
         history = getattr(session, "_conversation_history", None)
@@ -929,7 +978,12 @@ class QQReplyGenerationService:
         buffer 合并场景的草稿没人看到，各记一次会把被引用条目推进 suppression
         阈值、错误地从后续上下文消失。best-effort：失败只影响该条目晚几轮
         进入"暂不主动提及"。"""
-        if not context.is_group or not reply_text or context.ephemeral_session:
+        if not reply_text or context.ephemeral_session:
+            return
+        if not context.is_group:
+            await self._record_participant_mentions_on_delivery(
+                context, reply_text,
+            )
             return
         if not (getattr(self.plugin, "_qq_settings", {}) or {}).get(
             "group_memory_enabled", False,
@@ -942,6 +996,42 @@ class QQReplyGenerationService:
         if not user_data or not user_data.get("memory_enabled"):
             return
         await self._record_scoped_mentions_best_effort(context, reply_text)
+
+    async def _record_participant_mentions_on_delivery(
+        self, context: QQReplyContext, reply_text: str,
+    ) -> None:
+        """私聊 participant 轮的 mention 计数（对偶群路径）。
+
+        没有它，scoped 条目的防重复 suppression 对私聊 participant 永不
+        生效，模型会在每次回复里重复提起同一条事实。legacy admin 私聊走
+        本体 post_turn，不在这里记。"""
+        if not getattr(context, "participant_memory_enabled", False):
+            return
+        if not (getattr(self.plugin, "_qq_settings", {}) or {}).get(
+            "private_participant_memory_enabled", False,
+        ):
+            # 与群分支同语义：开关关掉之后不得再改 participant 域元数据。
+            return
+        session_key = self.plugin.session_runtime_service.build_generation_session_key(context)
+        user_data = self.plugin._user_sessions.get(session_key)
+        if not user_data or not user_data.get("memory_enabled"):
+            return
+        sender_id = str(context.sender_id or "").strip()
+        if not sender_id or is_synthetic_source(
+            getattr(context, "source_kind", ""),
+        ):
+            # 合成轮的名义 sender 不是真实对话方；缺 sender 时 fail-closed
+            # ——绝不退化成无 subject 的 legacy 写。
+            return
+        try:
+            await self.plugin.memory_bridge.post_scoped_mentions(
+                context.her_name, reply_text,
+                subjects=[
+                    self.plugin.memory_bridge.participant_subject(sender_id),
+                ],
+            )
+        except Exception as e:
+            self.plugin.logger.warning(f"participant mention 记录失败（忽略）: {e}")
 
     async def _record_scoped_mentions_best_effort(
         self, context: QQReplyContext, reply_text: str,

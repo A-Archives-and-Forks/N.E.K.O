@@ -441,6 +441,64 @@ async def test_shared_session_rebinds_recall_subjects_every_turn():
 
 
 @pytest.mark.asyncio
+async def test_private_participant_turn_refreshes_empty_memory_prompt():
+    """A reused private participant session must not retain scoped memory
+    from its creation prompt when the current turn has no memory dependency."""
+    from utils.llm_client import SystemMessage
+
+    plugin = _tool_plugin(settings={
+        "private_participant_memory_enabled": True,
+        "allow_cross_group_context": True,
+    })
+    service = _generation_service(plugin)
+    seen_prompts: list[str] = []
+
+    async def _script(client, message):
+        seen_prompts.append(client._conversation_history[0].content)
+        client._conversation_history.append(
+            SimpleNamespace(type="human", content=message)
+        )
+        client._conversation_history.append(
+            SimpleNamespace(type="ai", content="fresh reply")
+        )
+
+    original = SystemMessage(content="cached scoped memory")
+    client = _RecallToolClient(_script)
+    client._conversation_history = [original]
+    client._instructions = original.content
+    context = _group_context(
+        is_group=False,
+        group_id=None,
+        permission_level="trusted",
+        system_prompt="fresh prompt without memory",
+        recalled_memory_text="",
+        core_memory_text="",
+        cross_session_section="",
+        cross_group_section="",
+        recall_via_tool=False,
+        participant_memory_enabled=True,
+        private_memory_mode="participant",
+        used_member_subject=False,
+    )
+
+    await service._run_session_generation(
+        context=context,
+        session_key="private:2046",
+        user_data={
+            "lock": asyncio.Lock(),
+            "private_memory_mode": "participant",
+            "memory_enabled": True,
+        },
+        user_session=client,
+        reply_chunks=[],
+    )
+
+    assert seen_prompts == ["fresh prompt without memory"]
+    assert client._conversation_history[0] is original
+    assert client._instructions == original.content
+
+
+@pytest.mark.asyncio
 async def test_recall_tool_disarmed_after_every_turn():
     """The per-turn arm has a symmetric disarm: other generation paths on
     the same client (proactive prompt_ephemeral) must never inherit this
@@ -1880,6 +1938,52 @@ async def test_bootstrap_rebuilds_stale_route_session(monkeypatch):
     reused = await service.ensure_generation_session(context, "group:7788")
     assert reused is created
     discard.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_late_stale_private_mode(monkeypatch):
+    """A queued old-permission turn can create a session after permission
+    invalidation has already finished; the next current turn must still
+    reject that unmarked stale-mode session."""
+    from plugin.plugins.qq_auto_reply import session_bootstrap_service as sbs
+
+    route = (TOOL_CAPABLE_BASE_URL, TOOL_CAPABLE_MODEL)
+    config = SimpleNamespace(
+        aensure_region_resolved=AsyncMock(),
+        get_model_api_config=lambda kind: {
+            "base_url": route[0], "model": route[1], "api_key": "k",
+        },
+    )
+    monkeypatch.setattr(sbs, "get_config_manager", lambda: config)
+    stale_entry = {
+        "login_self_id": "10000",
+        "her_name": "Neko",
+        "conversation_route": route,
+        "private_memory_mode": "legacy",
+        "permission_level": "trusted",
+        "session": SimpleNamespace(),
+    }
+    discard = AsyncMock(return_value=False)
+    plugin = SimpleNamespace(
+        _user_sessions={"private:2046": stale_entry},
+        logger=MagicMock(),
+        session_runtime_service=SimpleNamespace(discard_session=discard),
+    )
+    context = SimpleNamespace(
+        ephemeral_session=False,
+        login_self_id="10000",
+        her_name="Neko",
+        is_group=False,
+        private_memory_mode="participant",
+        permission_level="trusted",
+    )
+
+    service = sbs.QQSessionBootstrapService(plugin)
+    assert await service.ensure_generation_session(
+        context, "private:2046",
+    ) is None
+    discard.assert_awaited_once()
+    assert stale_entry["pending_identity_discard"] is True
 
 
 

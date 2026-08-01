@@ -97,6 +97,12 @@ class QQReplyRequest:
     # 接收边界的 member 记忆政策快照（None=旁路调用者，build 内回退实时
     # 读）：handler 排队期间 OFF->ON 不得让收到时无授权的发言被收集。
     member_memory_at_receipt: bool | None = None
+    # 接收边界的私聊 participant 记忆政策快照（语义同上，作用于非 admin
+    # 私聊轮；admin 私聊与群轮忽略它）。
+    participant_memory_at_receipt: bool | None = None
+    # 私聊权限的接收边界快照。权限编辑可能发生在 handler 排队期间；记忆
+    # 域必须仍按消息到达时的 admin/participant 身份选择。
+    private_permission_level_at_receipt: str | None = None
 
 
 @dataclass(slots=True)
@@ -165,6 +171,13 @@ class QQReplyContext:
     # 轮次构建时刻的 group_member_memory_enabled 快照：成员发言入 bucket
     # 与否绑定发言时刻的授权状态——生成期间才切 ON 的轮不得回溯收集。
     member_memory_enabled: bool = False
+    # 本轮是否为私聊 participant 记忆轮（非 admin 私聊 + 接收时刻政策
+    # ON）：读写都以对方的 participant 域为界，绝不落入 legacy 私聊主人
+    # 语料（bridge 侧 subjects=None 的语义）。
+    participant_memory_enabled: bool = False
+    # 本轮按接收时权限选择的持久化域；None 表示本轮没有私聊记忆授权。
+    private_memory_mode: str | None = None
+    private_permission_level_at_receipt: str | None = None
     # 本轮 prompt 里的跨群段原文（未注入时为空）：生成前在会话锁内复检
     # 授权，撤销时按原文摘除。
     cross_group_section: str = ""
@@ -202,6 +215,9 @@ class QQModelResult:
     allow_fallback: bool = False
     fallback_reason: str = ""
     traces: list[QQPipelineStageTrace] = field(default_factory=list)
+    # Exact session-history row produced by this generation. Delivery can
+    # finish after a later turn has overwritten the session-wide current row.
+    history_ai_row: Any = None
 
 
 @dataclass(slots=True)
@@ -273,3 +289,4 @@ class QQReplyOutcome:
     delivery_plan: QQDeliveryPlan | None = None
     delivery_result: QQDeliveryResult | None = None
     traces: list[QQPipelineStageTrace] = field(default_factory=list)
+    history_ai_row: Any = None

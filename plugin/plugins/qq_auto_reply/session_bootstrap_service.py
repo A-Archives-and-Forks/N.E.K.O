@@ -18,6 +18,9 @@ def generation_session_is_reusable(
     login_self_id: Any,
     her_name: Any,
     conversation_route: tuple[str, str] | None = None,
+    is_group: bool | None = None,
+    private_memory_mode: str | None = None,
+    permission_level: str | None = None,
 ) -> bool:
     """Whether this turn keeps an existing session instead of rebuilding it.
 
@@ -36,7 +39,12 @@ def generation_session_is_reusable(
     recall channel at all: the context skips the synchronous recall per
     the new config while the arm step refuses the old client's route.
     Entries without a stored route (pre-upgrade / lightweight callers)
-    skip the comparison."""
+    skip the comparison.
+
+    Private sessions additionally bind one permission/memory-domain contract.
+    A receipt-stamped handler may create an old-domain session after settings
+    invalidation already finished, so pending-discard markers alone cannot
+    prove that the cached prompt is safe for the current turn."""
     if not entry:
         return False
     if entry.get("login_self_id") != login_self_id:
@@ -44,6 +52,13 @@ def generation_session_is_reusable(
     if her_name is not None and entry.get("her_name") != her_name:
         return False
     if entry.get("pending_identity_discard"):
+        return False
+    if entry.get("pending_permission_discard"):
+        return False
+    if is_group is False and (
+        entry.get("private_memory_mode") != private_memory_mode
+        or entry.get("permission_level") != permission_level
+    ):
         return False
     stored_route = entry.get("conversation_route")
     if (
@@ -81,11 +96,27 @@ class QQSessionBootstrapService:
                 )
             except Exception:
                 current_route = None
+        context_is_group = getattr(context, "is_group", None)
+        context_private_memory_mode = getattr(context, "private_memory_mode", None)
+        context_permission_level = getattr(context, "permission_level", None)
+        private_contract_changed = bool(
+            existing_session
+            and context_is_group is False
+            and (
+                existing_session.get("private_memory_mode")
+                != context_private_memory_mode
+                or existing_session.get("permission_level")
+                != context_permission_level
+            )
+        )
         if existing_session and not generation_session_is_reusable(
             existing_session,
             login_self_id=context.login_self_id,
             her_name=getattr(context, "her_name", None),
             conversation_route=current_route,
+            is_group=context_is_group,
+            private_memory_mode=context_private_memory_mode,
+            permission_level=context_permission_level,
         ):
             # her_name 失配=活跃角色切换：旧会话的 scoped 缓冲仍属旧角色，
             # discard 内的集中抢救会以旧 her_name 结算——新角色的对话绝不
@@ -93,18 +124,23 @@ class QQSessionBootstrapService:
             character_changed = existing_session.get("her_name") != getattr(
                 context, "her_name", existing_session.get("her_name"),
             )
-            discarded = await self.plugin.session_runtime_service.discard_session(session_key, reason="登录身份/角色/线路变化")
+            permission_changed = bool(
+                existing_session.get("pending_permission_discard")
+            ) or private_contract_changed
+            discarded = await self.plugin.session_runtime_service.discard_session(
+                session_key, reason="登录身份/角色/线路/私聊权限变化",
+            )
             if discarded is False:
                 # 粘性标记：prime 会把 login_self_id 刷成新值，若只靠 id
                 # 不匹配做重试条件，下一轮就再也进不来这里了。
                 existing_session["pending_identity_discard"] = True
-                if character_changed:
+                if character_changed or permission_changed:
                     # 角色切换 + 抢救失败：绝不能拿旧角色的会话生成——
                     # 新轮的 human/ai 行会挂在 her_name 仍是旧角色的
                     # user_data 上，之后的重试结算会把它们写进旧角色的
                     # 记忆库。本轮放弃生成，等下轮重试抢救。
                     self.plugin.logger.warning(
-                        f"角色已切换但旧会话结算失败，跳过本轮生成待重试 "
+                        f"角色/权限已切换但旧会话结算失败，跳过本轮生成待重试 "
                         f"({session_key})"
                     )
                     return None
@@ -222,6 +258,17 @@ class QQSessionBootstrapService:
                 "last_synced_index": 0,
                 "last_activity_at": time.time(),
                 "memory_enabled": context.persist_memory,
+                # 私聊记忆模式在创建时刻定格（"participant"=以对方为主体
+                # 的 scoped 结算；"legacy"=admin 主人语料）：结算目标绝不
+                # 随 per-turn 的权限变化漂移——漂移的代价是把一个人的历史
+                # 写进另一个语料库。群会话恒 None。
+                "private_memory_mode": (
+                    None if context.is_group or not context.persist_memory
+                    else getattr(context, "private_memory_mode", None) or (
+                        "legacy" if context.permission_level == "admin"
+                        else "participant"
+                    )
+                ),
                 "memory_context_used": context.memory_context_used,
                 "has_cached_memory": False,
                 "session_key": session_key,
