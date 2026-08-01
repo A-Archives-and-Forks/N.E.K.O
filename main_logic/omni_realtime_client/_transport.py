@@ -41,6 +41,28 @@ from ._shared import (
 )
 
 
+def _response_id_text(value: Any) -> str | None:
+    """One reading of "does this name a response", used by both id sources.
+
+    Absent is ``None`` or the empty string — neither names anything, and
+    admitting the empty one would collapse every unidentified response onto a
+    shared identity. Zero is PRESENT: a provider numbering from zero names its
+    first response perfectly well.
+
+    Both halves matter and I got each wrong once. The original truthiness test
+    dropped `0`; replacing it with a bare ``is None`` check then stopped an
+    empty top-level ``response_id`` from falling back to the nested
+    ``response.id``, so a late terminal of that shape skipped the stale filter
+    and finalized whatever turn was current. Reading it in one place is what
+    keeps the two sources from disagreeing again.
+    """
+
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
+
+
 _ATTACHED_TRANSPORT = object()
 
 # Ceiling on each host step inside a fail-open release that may be cut short.
@@ -1034,9 +1056,24 @@ class _TransportMixin:
         twice — and a repeat necessarily takes the stale branch, because the
         first one cleared ``_current_response_id`` — so counting on both paths
         without a guard would overstate usage for a case the transport
-        supports on purpose. Keyed by response id; a terminal with no id
-        never reaches the stale branch (that filter needs an id to compare),
-        so it can only be counted once anyway.
+        supports on purpose. Keyed by response id.
+
+        The last sentence of this docstring used to read "a terminal with no
+        id never reaches the stale branch, so it can only be counted once
+        anyway." That is backwards. An id-less terminal never reaches the
+        stale branch precisely BECAUSE the filter needs an id — so a repeat of
+        it takes the ordinary terminal path both times, and the guard below,
+        keyed on an id it does not have, does not fire for either. Two copies
+        book twice; measured.
+
+        Left unfixed on purpose. A latch would have to be reset per turn, and
+        the provider class that omits a terminal id is the same one that omits
+        ``response.created`` — on such a connection there is no reset point at
+        all, so the latch would swallow every turn after the first. That trades
+        an accounting error no measured provider can produce for a real missed
+        bill. If a provider ever does repeat an id-less terminal, the fix
+        belongs at the terminal dispatch as a "this turn is already finalized"
+        latch, not here.
         """
 
         if not isinstance(resp_data, dict):
@@ -1402,6 +1439,27 @@ class _TransportMixin:
             # successor has not announced itself yet, so it has produced no
             # output of its own to erase.
             self._reset_per_turn_output_state()
+            # `_skip_until_next_response` is deliberately NOT touched here,
+            # and neither leaving it nor clearing it is right — which is the
+            # actual finding.
+            #
+            # Leaving it mutes the successor: `_interrupted` may be left for
+            # the next turn because `response.created` resets it, and this flag
+            # has no such reset, so the successor's every delta stays
+            # suppressed until its own terminal. But clearing it is not the
+            # answer either, because the flag may already belong to the
+            # successor: `create_response(skipped=True)` raises it BEFORE it
+            # enqueues (`_responses.py`), so a request queued behind the
+            # abandoned one owns it while it waits for the lane. Clearing would
+            # then un-skip a turn the caller explicitly asked to suppress.
+            #
+            # A flag with no owner cannot be correctly cleared or correctly
+            # left; picking a side is arbitrary. The fix is to give output
+            # suppression a per-turn identity, which is issue #2594. Until
+            # then this stays as it shipped rather than trading one wrong
+            # behaviour for another — the whole state is unreachable today
+            # (nothing on the WebSocket path passes `skipped=True`), so there
+            # is nothing to buy by guessing.
             # Both release paths raise it: the abandoned response may still be
             # streaming, and from here until the next response.created nothing
             # id-less can be attributed. Clearing _current_response_id above
@@ -1493,7 +1551,12 @@ class _TransportMixin:
         self._interrupted = True
 
         # 1. Cancel the current response
-        if self._current_response_id:
+        # Presence, not truthiness — the third site in this file where a
+        # numeric id of 0 would have read as "no response". Here the cost is
+        # the worst of the three: the barge-in would mark the turn interrupted
+        # and never send response.cancel, so generation keeps running and the
+        # arbiter lane stays held until the provider finishes on its own.
+        if self._current_response_id is not None:
             await self.cancel_response()
 
         self._is_responding = False
@@ -1583,14 +1646,23 @@ class _TransportMixin:
                 # include response identity let us reject those late events
                 # without changing the legacy behaviour of id-less proxies.
                 if event_type != "response.created":
-                    event_response_id = event.get("response_id")
-                    if event_type == "response.done" and not event_response_id:
+                    # Presence, not truthiness, on both reads — the same
+                    # correction the arbiter's `_event_response_id` gets in this
+                    # PR, and useless without it. A provider numbering from zero
+                    # would have response `0`'s late deltas, tool events and
+                    # terminal slip past this filter once a successor is
+                    # current, and a late terminal would then run the ordinary
+                    # host finalization against that successor.
+                    event_response_id = _response_id_text(event.get("response_id"))
+                    if event_response_id is None and event_type == "response.done":
                         response = event.get("response")
                         if isinstance(response, dict):
-                            event_response_id = response.get("id")
+                            event_response_id = _response_id_text(response.get("id"))
+                    tracked = self._current_response_id
+                    tracked_text = None if tracked is None else str(tracked)
                     if (
-                        event_response_id
-                        and event_response_id != self._current_response_id
+                        event_response_id is not None
+                        and event_response_id != tracked_text
                         # ...unless this connection has never announced a
                         # response at all. A provider that omits
                         # response.created never writes _current_response_id,
