@@ -976,6 +976,150 @@ def test_cloud_apply_fence_does_not_restore_over_a_concurrent_storage_mode_write
 
 
 @pytest.mark.unit
+def test_cloud_apply_fence_waits_for_writable_transaction(tmp_path):
+    import threading
+
+    cm = _make_config_manager(tmp_path)
+
+    from utils.cloudsave_runtime import (
+        cloud_apply_fence,
+        cloudsave_writable_transaction,
+    )
+
+    write_entered = threading.Event()
+    release_write = threading.Event()
+    fence_entered = threading.Event()
+    errors = []
+
+    def writer():
+        try:
+            with cloudsave_writable_transaction(
+                cm,
+                operation="save",
+                target="prompt_locale.json",
+            ):
+                write_entered.set()
+                assert release_write.wait(5)
+        except Exception as exc:
+            errors.append(exc)
+
+    def fenced_restore():
+        try:
+            with cloud_apply_fence(cm):
+                fence_entered.set()
+        except Exception as exc:
+            errors.append(exc)
+
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+    assert write_entered.wait(5)
+
+    fence_thread = threading.Thread(target=fenced_restore)
+    fence_thread.start()
+    assert not fence_entered.wait(0.1)
+
+    release_write.set()
+    writer_thread.join(5)
+    fence_thread.join(5)
+
+    assert errors == []
+    assert not writer_thread.is_alive()
+    assert not fence_thread.is_alive()
+    assert fence_entered.is_set()
+
+
+@pytest.mark.unit
+def test_cloud_apply_fence_requests_a_blocking_cross_process_lock(tmp_path, monkeypatch):
+    cm = _make_config_manager(tmp_path)
+
+    from utils.cloudsave_runtime import fence as fence_module
+
+    blocking_modes: list[bool] = []
+
+    def acquire(_config_manager, *, blocking=False):
+        blocking_modes.append(blocking)
+        return True
+
+    monkeypatch.setattr(fence_module, "acquire_cloud_apply_lock", acquire)
+    monkeypatch.setattr(fence_module, "release_cloud_apply_lock", lambda _cm: None)
+
+    with fence_module.cloud_apply_fence(cm):
+        pass
+
+    assert blocking_modes == [True]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_cloud_apply_fence_polls_without_blocking_event_loop(
+    tmp_path,
+    monkeypatch,
+):
+    cm = _make_config_manager(tmp_path)
+
+    from utils.cloudsave_runtime import fence as fence_module
+
+    blocking_modes: list[bool] = []
+    owner_threads: list[tuple[str, int]] = []
+    attempts = iter((False, False, True))
+
+    def acquire(_config_manager, *, blocking=False):
+        blocking_modes.append(blocking)
+        owner_threads.append(("acquire", threading.get_ident()))
+        return next(attempts)
+
+    def release(_config_manager):
+        owner_threads.append(("release", threading.get_ident()))
+
+    @contextlib.contextmanager
+    def state(_config_manager, **_kwargs):
+        yield {"mode": "maintenance_readonly"}
+
+    sleeps: list[float] = []
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(fence_module, "acquire_cloud_apply_lock", acquire)
+    monkeypatch.setattr(fence_module, "release_cloud_apply_lock", release)
+    monkeypatch.setattr(fence_module, "_cloud_apply_fence_state", state)
+    monkeypatch.setattr(fence_module.asyncio, "sleep", sleep)
+
+    async with fence_module.async_cloud_apply_fence(cm, poll_interval=0.01):
+        pass
+
+    assert blocking_modes == [False, False, False]
+    assert sleeps == [0.01, 0.01]
+    assert owner_threads[-1][0] == "release"
+    assert {thread_id for _, thread_id in owner_threads} == {threading.get_ident()}
+
+
+@pytest.mark.unit
+def test_win32_mutex_apis_use_pointer_sized_handle_signatures():
+    import ctypes
+
+    from utils.cloudsave_runtime import fence as fence_module
+
+    class Function:
+        argtypes = None
+        restype = None
+
+    class Kernel32:
+        CreateMutexW = Function()
+        WaitForSingleObject = Function()
+        ReleaseMutex = Function()
+        CloseHandle = Function()
+
+    kernel32 = Kernel32()
+    fence_module._configure_win32_mutex_apis(kernel32)
+
+    assert kernel32.CreateMutexW.restype is ctypes.c_void_p
+    assert kernel32.WaitForSingleObject.argtypes[0] is ctypes.c_void_p
+    assert kernel32.ReleaseMutex.argtypes == [ctypes.c_void_p]
+    assert kernel32.CloseHandle.argtypes == [ctypes.c_void_p]
+
+
+@pytest.mark.unit
 def test_local_cloudsave_round_trip_restores_runtime_truth(tmp_path):
     cm = _make_config_manager(tmp_path)
 
@@ -1946,6 +2090,38 @@ def test_export_snapshot_includes_external_import_state_sidecar(tmp_path):
     assert json.loads(staged.read_text(encoding="utf-8"))["daily"][
         "imported_day_fingerprints"
     ] == ["fp-x"]
+
+
+@pytest.mark.unit
+def test_export_snapshot_includes_prompt_locale_sidecars(tmp_path):
+    cm = _make_config_manager(tmp_path)
+
+    from utils.cloudsave_runtime import (
+        MANAGED_MEMORY_FILENAMES,
+        export_local_cloudsave_snapshot,
+    )
+
+    _write_runtime_state(cm, character_name="小满")
+    payloads = {
+        "prompt_locale.json": {"language": "zh-TW", "order": 3},
+        "scoped_prompt_locales.json": {
+            "subjects": {"group": {"language": "zh-TW", "order": 4}},
+        },
+    }
+    for filename, payload in payloads.items():
+        atomic_write_json(
+            Path(cm.memory_dir) / "小满" / filename,
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    export_local_cloudsave_snapshot(cm)
+
+    assert payloads.keys() <= set(MANAGED_MEMORY_FILENAMES)
+    for filename, payload in payloads.items():
+        staged = cm.cloudsave_dir / "characters" / "小满" / "memory" / filename
+        assert json.loads(staged.read_text(encoding="utf-8")) == payload
 
 
 @pytest.mark.unit

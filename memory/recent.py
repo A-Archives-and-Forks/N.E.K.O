@@ -29,7 +29,10 @@ from config.prompts.prompts_memory import (
     get_summary_stale_hint,
 )
 from utils.cloudsave_runtime import MaintenanceModeError, assert_cloudsave_writable
-from utils.language_utils import get_global_language
+from utils.language_utils import (
+    detect_prompt_language_with_ascii_fallback,
+    get_global_language_full,
+)
 from utils.tokenize import acount_tokens
 from config import (
     LLM_OUTPUT_GUARD_MAX_TOKENS,
@@ -44,6 +47,13 @@ from config import (
 )
 from datetime import datetime
 
+
+def _detect_recent_prompt_language(text: str) -> str:
+    return detect_prompt_language_with_ascii_fallback(
+        text,
+        ui_language=get_global_language_full(),
+    )
+
 # Backward-compat alias (Stage-1 → Stage-2 trigger threshold).
 # Two-stage flow: Stage 1 (`compress_history`) summarises raw messages with no
 # explicit length cap; Stage 2 (`further_compress`) is invoked only when Stage-1
@@ -56,6 +66,79 @@ MAX_SUMMARY_TOKENS = RECENT_SUMMARY_MAX_TOKENS
 # 抗碰撞（连续 3 条 mixed user+ai 几乎不会误命中）和定位精度。
 REVIEW_FINGERPRINT_K = 3
 REVIEW_FINGERPRINT_CONTENT_PREFIX = 50
+_PROMPT_TEXT_PART_TYPES = frozenset((None, 'text', 'input_text', 'output_text'))
+
+
+def _review_message_content(message) -> str:
+    if isinstance(message, dict):
+        content = message.get('content', '')
+        if 'content' not in message and isinstance(message.get('data'), dict):
+            content = message['data'].get('content', '')
+    elif hasattr(message, 'content'):
+        content = message.content
+    else:
+        return str(message)
+    content = content or ''
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get('text', '') or item))
+            else:
+                parts.append(str(item))
+        return '\n'.join(parts)
+    if isinstance(content, str):
+        return content
+    return str(content)
+
+
+def _message_locale_text(message) -> str:
+    if isinstance(message, dict):
+        content = message.get('content', '')
+        if 'content' not in message and isinstance(message.get('data'), dict):
+            content = message['data'].get('content', '')
+    elif hasattr(message, 'content'):
+        content = message.content
+    else:
+        return ''
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            if isinstance(item, str):
+                parts.append(item)
+            continue
+        item_type = item.get('type')
+        text = item.get('text')
+        if item_type in _PROMPT_TEXT_PART_TYPES and isinstance(text, str):
+            parts.append(text)
+    return '\n'.join(parts)
+
+
+def _message_prompt_role(message) -> str:
+    if isinstance(message, dict):
+        role = message.get('type') or message.get('role')
+        if not role and isinstance(message.get('data'), dict):
+            role = message['data'].get('type') or message['data'].get('role')
+    else:
+        role = getattr(message, 'type', None) or getattr(message, 'role', None)
+    return str(role or '').strip().lower()
+
+
+def _review_prompt_locale_text(messages: list) -> str:
+    """Prefer user turns as locale evidence for the review prompt."""
+    user_messages = [
+        message
+        for message in messages
+        if _message_prompt_role(message) in {'human', 'user'}
+    ]
+    locale_messages = user_messages or messages
+    return '\n\n'.join(
+        _message_locale_text(message) for message in locale_messages
+    )
 
 
 async def _await_recent_mutation_to_completion(func, *args):
@@ -77,20 +160,9 @@ async def review_context_token_count(messages: list) -> int:
     rows = []
     for message in messages:
         role = getattr(message, 'type', '') or ''
-        content = getattr(message, 'content', '') or ''
+        content = _review_message_content(message)
         if isinstance(message, dict):
             role = message.get('type', message.get('role', role)) or ''
-            content = message.get('content', content) or ''
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict):
-                    parts.append(str(item.get('text', '') or item))
-                else:
-                    parts.append(str(item))
-            content = '\n'.join(parts)
-        elif not isinstance(content, str):
-            content = str(content)
         rows.append(f"{role}: {content}")
     return await acount_tokens('\n\n'.join(rows))
 
@@ -802,6 +874,50 @@ class CompressedRecentHistoryManager:
         except Exception as e:
             logger.debug(f"[RecentHistory] {lanlan_name}: 写 recent_meta 失败: {e}")
 
+    def _render_message_content(self, msg):
+        from utils.tokenize import truncate_head_tail_tokens
+
+        content = getattr(msg, 'content', '')
+        half_cap = self._summary_message_half_cap()
+        if isinstance(content, str):
+            return truncate_head_tail_tokens(content, half_cap, half_cap)
+        parts = []
+        try:
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(item.get('text', f"|{item.get('type', '')}|"))
+                else:
+                    parts.append(str(item))
+        except Exception:
+            parts = [str(content)]
+        return truncate_head_tail_tokens(
+            "\n".join(parts),
+            half_cap,
+            half_cap,
+        )
+
+    @staticmethod
+    def _summary_message_half_cap():
+        return RECENT_PER_MESSAGE_MAX_TOKENS // 2
+
+    def _summary_prompt_locale_text(self, messages):
+        from utils.tokenize import truncate_head_tail_tokens
+
+        half_cap = self._summary_message_half_cap()
+        user_messages = [
+            msg for msg in messages
+            if _message_prompt_role(msg) in {'human', 'user'}
+        ]
+        locale_messages = user_messages or messages
+        return "\n".join(
+            truncate_head_tail_tokens(
+                _message_locale_text(msg),
+                half_cap,
+                half_cap,
+            )
+            for msg in locale_messages
+        )
+
     def _render_messages_to_text(self, messages, lanlan_name):
         """把消息列表渲染成喂给摘要 LLM 的文本：每条做头尾保留截断 + role 前缀。
 
@@ -809,35 +925,15 @@ class CompressedRecentHistoryManager:
         （head=tail=半数 token）。用户长贴 / AI 偶尔写小作文都会触发；头尾各
         保留确保问候/问题与结尾的总结/请求都不丢，中段砍掉。
         """
-        from utils.tokenize import truncate_head_tail_tokens
-        per_msg_cap = RECENT_PER_MESSAGE_MAX_TOKENS
-        head_tail = per_msg_cap // 2
         name_mapping = self.name_mapping.copy()
         name_mapping['ai'] = lanlan_name
         lines = []
         for msg in messages:
             role = name_mapping.get(getattr(msg, 'type', ''), getattr(msg, 'type', ''))
-            content = getattr(msg, 'content', '')
-            if isinstance(content, str):
-                content = truncate_head_tail_tokens(content, head_tail, head_tail)
-                line = f"{role} | {content}"
-            else:
-                parts = []
-                try:
-                    for item in content:
-                        if isinstance(item, dict):
-                            parts.append(item.get('text', f"|{item.get('type', '')}|"))
-                        else:
-                            parts.append(str(item))
-                except Exception:
-                    parts = [str(content)]
-                joined = "\n".join(parts)
-                joined = truncate_head_tail_tokens(joined, head_tail, head_tail)
-                line = f"{role} | {joined}"
-            lines.append(line)
+            lines.append(f"{role} | {self._render_message_content(msg)}")
         return "\n".join(lines)
 
-    def _build_summary_prompt(self, messages_text, detailed):
+    def _build_summary_prompt(self, messages_text, detailed, *, locale_text=None):
         """构建 Stage-1 摘要 prompt（不含 stale-hint 前缀；单次压缩与分段 map 共用）。
 
         ``{MASTER_NAME}`` 是 prompt 里"保留负面反馈"段引用 master 实名的字面
@@ -845,7 +941,9 @@ class CompressedRecentHistoryManager:
         做：它是 user-controlled，含 ``%`` 会让先前的 ``%`` formatting 崩溃；含
         ``%s`` 会被先前的 ``.replace("%s", ...)`` 二次替换（codex P2）。
         """
-        lang = get_global_language()
+        lang = _detect_recent_prompt_language(
+            locale_text if locale_text is not None else messages_text,
+        )
         master_name = self.name_mapping['human']
         if not detailed:
             return (
@@ -951,7 +1049,11 @@ class CompressedRecentHistoryManager:
         partials = []
         for chunk in chunks:
             s = await self._invoke_summary_llm(
-                self._build_summary_prompt(self._render_messages_to_text(chunk, lanlan_name), detailed)
+                self._build_summary_prompt(
+                    self._render_messages_to_text(chunk, lanlan_name),
+                    detailed,
+                    locale_text=self._summary_prompt_locale_text(chunk),
+                )
             )
             if s is None:
                 return None
@@ -990,6 +1092,7 @@ class CompressedRecentHistoryManager:
     # detailed: 保留尽可能多的细节
     async def compress_history(self, messages, lanlan_name, detailed=False):
         messages_text = self._render_messages_to_text(messages, lanlan_name)
+        locale_text = self._summary_prompt_locale_text(messages)
         # 输入过大（积压一直压不掉时会膨胀）→ 先分段 map-reduce 缩小输入，减小
         # 单次 LLM 输入、避免输入过大导致超时。正常输入不走这条。
         if await acount_tokens(messages_text) > RECENT_COMPRESS_INPUT_BUDGET_TOKENS:
@@ -999,8 +1102,12 @@ class CompressedRecentHistoryManager:
                 return None
             messages_text = reduced
 
-        lang = get_global_language()
-        prompt = self._build_summary_prompt(messages_text, detailed)
+        lang = _detect_recent_prompt_language(locale_text)
+        prompt = self._build_summary_prompt(
+            messages_text,
+            detailed,
+            locale_text=locale_text,
+        )
 
         # Past block 时间衰减：距上次"实际更新 past block"超过
         # RECENT_SUMMARY_STALE_HOURS 小时时，在 prompt 头部加提醒让 LLM 把明显
@@ -1056,7 +1163,10 @@ class CompressedRecentHistoryManager:
         # 第二个返回值（用于上层缓存）跟 memo_text 用的 summary 保持一致——之前
         # 用 raw 摘要会出现"用户看到的 memo 用 stage-2、缓存却存 stage-1"的不一致。
         from config.prompts.prompts_sys import _loc, MEMORY_MEMO_WITH_SUMMARY
-        memo_text = _loc(MEMORY_MEMO_WITH_SUMMARY, get_global_language()).format(summary=summary)
+        memo_text = _loc(
+            MEMORY_MEMO_WITH_SUMMARY,
+            lang,
+        ).format(summary=summary)
         return SystemMessage(content=memo_text), summary
 
     async def _notify_compress_done(
@@ -1249,7 +1359,12 @@ class CompressedRecentHistoryManager:
                 try:
                     response_content = (await llm.ainvoke(
                         # codex P2：先 % 再 .replace，否则 master_name 含 % 会崩
-                        (get_further_summarize_prompt(get_global_language()) % initial_summary)
+                        (
+                            get_further_summarize_prompt(
+                                _detect_recent_prompt_language(initial_summary)
+                            )
+                            % initial_summary
+                        )
                         .replace("{MASTER_NAME}", self.name_mapping['human']),
                         max_completion_tokens=stage2_cap,
                     )).content
@@ -1497,15 +1612,7 @@ class CompressedRecentHistoryManager:
             else:
                 role = "unknown"
 
-            if hasattr(msg, 'content'):
-                if isinstance(msg.content, str):
-                    content = msg.content
-                elif isinstance(msg.content, list):
-                    content = "\n".join([str(i) if isinstance(i, str) else i.get("text", str(i)) for i in msg.content])
-                else:
-                    content = str(msg.content)
-            else:
-                content = str(msg)
+            content = _review_message_content(msg)
 
             history_text += f"{role}: {content}\n\n"
 
@@ -1530,7 +1637,11 @@ class CompressedRecentHistoryManager:
                     # codex P2：先 % formatting 再 .replace，否则 master_name 含 %
                     # 会让 5-arg `% (...)` 把它当格式符崩溃
                     (
-                        get_history_review_prompt(get_global_language())
+                        get_history_review_prompt(
+                            _detect_recent_prompt_language(
+                                _review_prompt_locale_text(snapshot)
+                            )
+                        )
                         % (self.name_mapping['human'], name_mapping['ai'], history_text, self.name_mapping['human'], name_mapping['ai'])
                     )
                     .replace("{MASTER_NAME}", self.name_mapping['human'])

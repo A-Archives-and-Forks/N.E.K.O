@@ -308,18 +308,40 @@ def _resolve_topic_hook_locale(
     fallback: str,
 ) -> str:
     """Resolve the locale for topic-hook prompts without collapsing zh-TW."""
-    for raw_lang in (
-        *_command_language_candidates(data),
-        getattr(mgr, "user_language", None),
-    ):
-        if raw_lang and is_supported_language_code(raw_lang):
-            normalized = normalize_language_code(raw_lang, format="full")
-            if normalized:
-                return normalized
+    declared = _resolve_declared_topic_hook_locale(data, mgr)
+    if declared:
+        return declared
     global_lang = normalize_language_code(get_global_language_full(), format="full")
     if global_lang:
         return global_lang
     return fallback
+
+
+def _resolve_declared_topic_hook_locale(
+    data: ProactiveChatCommand | dict,
+    mgr,
+) -> str | None:
+    """Resolve only a locale explicitly declared by the request or session."""
+    for raw_lang in _command_language_candidates(data):
+        if raw_lang and is_supported_language_code(raw_lang):
+            normalized = normalize_language_code(raw_lang, format="full")
+            if normalized:
+                return normalized
+    if not getattr(mgr, "_user_language_explicit", False):
+        return None
+    raw_lang = getattr(mgr, "user_language", None)
+    if raw_lang and is_supported_language_code(raw_lang):
+        return normalize_language_code(raw_lang, format="full") or None
+    return None
+
+
+def _new_dialog_locale_params(
+    data: ProactiveChatCommand | dict,
+    mgr,
+) -> dict[str, str] | None:
+    """Only explicit user locale evidence may update durable prompt state."""
+    declared = _resolve_declared_topic_hook_locale(data, mgr)
+    return {"language": declared} if declared else None
 
 
 async def handle_proactive_chat(
@@ -1210,11 +1232,21 @@ async def handle_proactive_chat(
 
         raw_memory_context = ""
         try:
+            proactive_lang = _resolve_proactive_locale(command, mgr)
+        except Exception:
+            proactive_lang = "zh"
+        topic_hook_lang = _resolve_topic_hook_locale(
+            command,
+            mgr,
+            fallback=proactive_lang,
+        )
+        try:
             from utils.internal_http_client import get_internal_http_client
 
             _pt_client = get_internal_http_client()
             resp = await _pt_client.get(
                 f"http://127.0.0.1:{MEMORY_SERVER_PORT}/new_dialog/{lanlan_name}",
+                params=_new_dialog_locale_params(command, mgr),
                 timeout=5.0,
             )
             resp.raise_for_status()  # Check for HTTP errors explicitly
@@ -1262,16 +1294,6 @@ async def handle_proactive_chat(
         # ========== 2. 选择语言 ==========
         # 与 mini-game 邀请短路同源：request body → mgr.user_language → 全局缓存。
         # 见 _resolve_proactive_locale 的 docstring。
-        try:
-            proactive_lang = _resolve_proactive_locale(command, mgr)
-        except Exception:
-            proactive_lang = "zh"
-        topic_hook_lang = _resolve_topic_hook_locale(
-            command,
-            mgr,
-            fallback=proactive_lang,
-        )
-
         # ========== 3. 注入近期搭话记录 ==========
         proactive_chat_history_prompt = _format_recent_proactive_chats(
             lanlan_name, proactive_lang
