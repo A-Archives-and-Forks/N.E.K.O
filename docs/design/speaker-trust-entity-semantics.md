@@ -531,34 +531,39 @@ R11 **无法离线判定**：零 fixture、零 vendored SDK、零文档样例、
 
 > **修订文档 §2.14.2 宣称的「backlog 零成本取证」对群路径失效，必须改为读日志。** 原因：`qq_open_plat.py:605` 只读 `data.get("group_id")`，而 `group_openid` **全仓零命中**；若平台按 v2 语义下发 `group_openid`，`group_id` 恒为空串 ⇒ `backlog_service.py:88-90` 的 `if not group_id: return` 让群消息**根本不落 `backlog_state.json`**。
 
-**A. 一行临时插桩（wire 零改动）**
+**A. 插桩已经在仓库里了（不必再改代码）**
 
-在 `plugin/plugins/qq_auto_reply/qq_open_plat.py` 的 `_receive_loop` 中，紧接 `:181`（`event_type = payload.get("t", "")`）之后插入：
-
-```python
-if self.logger and event_type in ("GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
-    _d = payload["d"] or {}
-    self.logger.info("[R11] %s author=%s group_keys=%s author_keys=%s", event_type,
-                     json.dumps((_d.get("author") or {}).get("id"), ensure_ascii=False),
-                     sorted(k for k in _d if "group" in k.lower()),
-                     sorted((_d.get("author") or {}).keys()))
-```
+`qq_open_plat.py` 顶部「R11 身份作用域取证」一节即本小节所述的插桩，落在
+`_receive_loop` 里 `event_type = payload.get("t", "")` 之后、`_convert_event`
+之前。默认**关**，开关是 `qq_open_identity_probe_enabled`，UI 在开放平台的
+**「信任用户」页**（`open_platform.html` 的 `page-config-accounts`，紧跟
+`accounts_hint` 那句「ID 为加密 openid…可在日志中查看」之后——开关就是那句话的
+下一句）。开关按事件现读，一旦生效不必重连；但**打开**要等写盘成功才对运行时
+可见（与记忆开关同族的采集授权，见 `settings_service.py` 的 `deferred_opt_ins`），
+关掉则立刻生效。
 
 > **只打取证需要的那四项，不要 `json.dumps(payload["d"])`。** §2.15.4.2 的判定
 > 只需要 ①`author.id` ②`author` 的兄弟键**名** ③群 id 的键**名** ④C2C 的
 > `author.id` —— 四项里没有一项需要消息正文。而这条日志落的是**持久**文件
 > （`我的文档/N.E.K.O/logs/`，重启留存，正是取证要它持久的原因），整份 `d`
-> 会把群聊原文、附件 URL、@ 列表一起写进去。取证结束后插桩本身要回滚，但
+> 会把群聊原文、附件 URL、@ 列表一起写进去。取证结束后开关要关掉，但
 > 已经落盘的日志不会跟着回滚。
 
-- **必须用 `self.logger`**（文件 logger，`__init__.py:100-101` `enable_file_logging`），落 `我的文档/N.E.K.O/logs/N.E.K.O_Plugin_qq_auto_reply_*.log`（`plugin/core/plugin_logger.py:15`），重启留存。**不能用 `_emit_log`**——它只写 `collections.deque(maxlen=500)` 内存环（`__init__.py:104-111`），重启即失。
-- **必须插在 `:181` 而不是 `_convert_event` 内**：绕开 `group_id` 键名不确定性，也早于 `backlog_service.py:91-93` 的信任群白名单闸。
+落地实现比这段原始设计多两处：**兄弟键的值也打**（只打键名回答不了 ② 的后半
+「哪一个兄弟键跨群相等」），以及**标识符字段按名字形状挑**（`id` / `*_id` /
+`*openid*`）而不是按枚举挑——取证要找的正是没预料到的那个键，枚举会把它挡在
+日志外面。非标识符字段一律只出键名、不出值。
 
-**B. 维护者操作（三步，不可再省）**
+- **两个出口都要写，缺一不可**（`_write_identity_probe`）。`self.logger` 是文件 logger（`__init__.py` `enable_file_logging`），落 `我的文档/N.E.K.O/logs/N.E.K.O_Plugin_qq_auto_reply_*.log`（`plugin/core/plugin_logger.py:15`），**重启留存**——这份才是能整个发给开发者的东西；光有它却**不够**：`_emit_log` 写的那个 500 条内存环才是 UI「运行日志」页读的池子（`get_recent_logs` 只在内存环为空时才回退读文件，而环从启动那刻起恒非空），少了它用户勾完开关在界面上什么也看不到——而隔壁 `accounts_hint` 刚说过「可在日志中查看」。反过来只写 `_emit_log` 也不行：内存环重启即失，取证要的恰恰是重启之后还能翻出来。
+- **必须插在 `_receive_loop` 而不是 `_convert_event` 内**：绕开 `group_id` 键名不确定性，也早于 `backlog_service.py:91-93` 的信任群白名单闸。
+- 单次连接封顶 200 条（`_IDENTITY_PROBE_MAX_LINES`），封顶后补一条提示、不再记录。计数器挂在 `QQOpenPlatformConnection` 实例上，而 `qq_client` 只有在**切换连接模式**时才被置 None 重建（`runtime_ops_service.py:44-48`）——侧栏的「停止 → 启动」复用同一个对象，计数器纹丝不动，**只有重启应用才重新计数**。这是「开关忘了关」的兜底，取证本身只需要三条。
+
+**B. 维护者操作（四步，不可再省）**
 
 1. `qq_connection_mode` 切 `open_platform`，填真实 appId / secret；
-2. **同一个真实 QQ 号**在群 X @bot 一次、在群 Y @bot 一次；
-3. 同一账号私聊 bot 一条。
+2. 在**「信任用户」页**勾上「记录每条消息里的 ID」并保存（保存成功才会生效）；
+3. **同一个真实 QQ 号**在群 X @bot 一次、在群 Y @bot 一次；
+4. 同一账号私聊 bot 一条。取证做完把开关关掉。
 
 **C. 看哪个文件的哪个字段**
 
@@ -612,6 +617,20 @@ if self.logger and event_type in ("GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE
 **(a) 群字段键名比 R11 更早爆。** `qq_open_plat.py:605` 只读 `data.get("group_id")`，`group_openid` 全仓零命中；仓库自己已经知道该通道群 id 是 openid（`display_name_service.py:19` 逐字写着）。若平台下发 `group_openid`：`group_id` 恒空 ⇒ `backlog_service.py:88-90` **静默丢掉所有群消息**（连 backlog 都不落）⇒ 群 subject 退化成 `qq::` 被 `scopes.py:88-96` 直接拒 ⇒ 发送路径 POST 到 `/v2/groups//messages`。
 
 **(b) admin bootstrap 缺陷今天就可能已兑现。** `message_dispatcher.py:34-54` 的 `_maybe_reserve_open_platform_admin` 在**第一条私聊**（C2C）上把 `sender_id` 写成 admin（`:415-417`），而群路径用群事件的 `author.id` 鉴权（`:196-204`）。若二者作用域不同，**通过私聊授权的主人在所有群里都不被识别为主人**——这是用户可见的**现存**缺陷，不是未来风险。
+
+> **已落地的是「让它可见」，不是「修好它」。** `message_dispatcher.py` 的
+> `_note_open_platform_identity_scope` 是纯观测告警：open 通道下、名册里有
+> admin、而某个群里连续出现三个互不相同的说话人却无一匹配名册时，打一条
+> `[R11]` 诊断（文件日志 + 插件运行日志页），并从此对该群闭嘴；该群但凡有一
+> 个人匹配上，就永久闭嘴。它不改任何权限判定——若 id 本来同作用域，它是彻底的
+> no-op。真正的修法要等 §2.15.4.2 的取证数据回来。
+>
+> **不要**把 `_maybe_reserve_open_platform_admin` 里那句全局
+> `if permission_mgr.list_users(): return` 改成「按当前通道过滤后判空」。那不
+> 是疏漏，是让通道切换 fail-closed 的门：按通道过滤在刚切到 open_platform 时
+> 恒为空，等于让切换后第一个私聊 bot 的陌生人自动拿到 admin —— base 1.0 +
+> `speaker_is_owner` + 主人记忆读取权 + 对全体说话人账本签发
+> confirmation/correction 的权力。
 
 **R11 兑现的后果比修订文档 §2.14.1 描述的严重一个量级。** 文档说是「trust 按群碎成 N 份、攒不到 cap」，实际是**三条轴同时归零**：`trusted_users` 按裸 actor 索引 ⇒ 主人在其他群解析成 `none`(base 0.3) ⇒ `speaker_is_owner ≡ tier=='admin'` 为 False ⇒ `aevaluate_speaker_trust_events` 在那些群里**根本不产生任何 confirmation/correction** ⇒ adjustment 的**来源**断供。碎片化只是最轻的那一层。
 
