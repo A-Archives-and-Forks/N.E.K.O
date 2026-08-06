@@ -1045,6 +1045,8 @@ def test_compact_tool_fan_uses_shell_local_anchor_not_fixed_viewport_position():
 
     assert "position: absolute;" in fan_block
     assert "--compact-tool-wheel-hover-radius: 116px;" in fan_block
+    assert "--compact-tool-wheel-music-control-cutout-width: 160px;" in fan_block
+    assert "--compact-tool-wheel-music-control-cutout-height: 96px;" in fan_block
     assert "--compact-tool-wheel-orbit-radius: 80px;" in fan_block
     assert "--compact-tool-fan-focus-x: var(--compact-tool-wheel-hover-radius);" in fan_block
     assert "--compact-tool-fan-focus-y: var(--compact-tool-wheel-hover-radius);" in fan_block
@@ -1068,6 +1070,18 @@ def test_compact_tool_fan_uses_shell_local_anchor_not_fixed_viewport_position():
     assert ".compact-input-tool-wheel-charge" in styles
     assert "width: calc(var(--compact-tool-wheel-hover-radius) * 2);" in styles
     assert '.compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-fan-hit-region' in styles
+    assert '.app-shell:has(> #music-player-mount.compact-music-player-mount > .music-player-bar:not([hidden]))' in styles
+    assert "var(--compact-tool-wheel-music-control-cutout-width)" in styles
+    assert "var(--compact-tool-wheel-music-control-cutout-height)" in styles
+    assert "function getCompactToolFanMusicControlCutoutRect(element, parentRect)" in script
+    assert "#music-player-mount.compact-music-player-mount > .music-player-bar:not([hidden])" in script
+    assert "function subtractCompactRect(rect, cutoutRect)" in script
+    assert "COMPACT_TOOL_FAN_MUSIC_CONTROL_CUTOUT_WIDTH = 160;" in script
+    assert "COMPACT_TOOL_FAN_MUSIC_CONTROL_CUTOUT_HEIGHT = 96;" in script
+    assert "--compact-tool-wheel-music-control-cutout-width" in script
+    assert "--compact-tool-wheel-music-control-cutout-height" in script
+    assert "nativeRects = nativeRects.reduce" in collector_block
+    assert "subtractCompactRect(nativeRect, musicControlCutoutRect)" in collector_block
     assert '.compact-input-tool-fan[data-compact-tool-wheel-charge-active="true"] .compact-input-tool-wheel-charge' in styles
     assert "conic-gradient(" in styles
     assert "--compact-tool-wheel-charge-first-angle" in styles
@@ -2645,10 +2659,33 @@ def test_subtitle_web_host_keeps_compact_history_transparent_wrappers_click_thro
         f'{compact_surface_prefix} [data-compact-geometry-owner="surface"],\n'
         f'{compact_surface_prefix} [data-compact-geometry-owner="surface"] *,\n'
         f'{compact_surface_prefix} #reactChatWindowMinimizeButton,\n'
-        f'{compact_surface_prefix} #reactChatWindowMinimizeButton *,\n'
-        f'{compact_surface_prefix} .compact-input-tool-fan[data-compact-input-tool-fan-open="true"],\n'
-        f'{compact_surface_prefix} .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] * {{\n'
+        f'{compact_surface_prefix} #reactChatWindowMinimizeButton * {{\n'
         "    pointer-events: auto;\n"
+        "}"
+    )
+    tool_fan_passthrough_rule = (
+        f'{compact_surface_prefix} #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] {{\n'
+        "    pointer-events: none !important;\n"
+        "}"
+    )
+    visible_tool_fan_interactive_rule = (
+        f'{compact_surface_prefix} #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-fan-hit-region,\n'
+        f'{compact_surface_prefix} #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-item:not([data-compact-tool-wheel-slot="hidden"]):not([data-compact-tool-wheel-slot="hidden-forward"]):not([data-compact-tool-wheel-slot="hidden-backward"]),\n'
+        f'{compact_surface_prefix} #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .avatar-tool-quickbar,\n'
+        f'{compact_surface_prefix} #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .avatar-tool-quickbar * {{\n'
+        "    pointer-events: auto !important;\n"
+        "}"
+    )
+    hidden_tool_fan_slots_rule = (
+        f'{compact_surface_prefix} #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-item[data-compact-tool-wheel-slot="hidden"],\n'
+        f'{compact_surface_prefix} #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-item[data-compact-tool-wheel-slot="hidden-forward"],\n'
+        f'{compact_surface_prefix} #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-item[data-compact-tool-wheel-slot="hidden-backward"] {{\n'
+        "    pointer-events: none !important;\n"
+        "}"
+    )
+    visible_music_tool_fan_cutout_rule = (
+        f'{compact_surface_prefix} #react-chat-window-root .app-shell:has(> #music-player-mount.compact-music-player-mount > .music-player-bar:not([hidden])) .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-fan-hit-region {{\n'
+        "    clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%, 0 var(--compact-tool-wheel-music-control-cutout-height), var(--compact-tool-wheel-music-control-cutout-width) var(--compact-tool-wheel-music-control-cutout-height), var(--compact-tool-wheel-music-control-cutout-width) 0);\n"
         "}"
     )
     compact_music_interactive_rule = (
@@ -2696,6 +2733,10 @@ def test_subtitle_web_host_keeps_compact_history_transparent_wrappers_click_thro
     )
 
     assert broad_surface_rule in styles
+    assert tool_fan_passthrough_rule in styles
+    assert visible_tool_fan_interactive_rule in styles
+    assert hidden_tool_fan_slots_rule in styles
+    assert visible_music_tool_fan_cutout_rule in styles
     assert compact_music_interactive_rule in styles
     assert compact_music_hidden_rule in styles
     assert history_passthrough_rule in styles
@@ -2708,6 +2749,9 @@ def test_subtitle_web_host_keeps_compact_history_transparent_wrappers_click_thro
     assert styles.index(history_passthrough_rule) < styles.index(meme_passthrough_rule)
     assert styles.index(meme_passthrough_rule) < styles.index(meme_close_interactive_rule)
     assert styles.index(meme_close_interactive_rule) < styles.index(history_interactive_rule)
+    assert styles.index(broad_surface_rule) < styles.index(tool_fan_passthrough_rule)
+    assert styles.index(tool_fan_passthrough_rule) < styles.index(visible_tool_fan_interactive_rule)
+    assert styles.index(visible_tool_fan_interactive_rule) < styles.index(hidden_tool_fan_slots_rule)
     assert ".compact-export-history-scroll,\n" in history_passthrough_rule
 
 
