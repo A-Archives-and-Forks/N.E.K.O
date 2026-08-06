@@ -192,6 +192,7 @@ _YUI_GUIDE_ASSET_VERSION_PATHS = (
     _PROJECT_ROOT / "static/css/voice_identity.css",
     _PROJECT_ROOT / "static/css/model_manager.css",
     *_MODEL_MANAGER_JS_PATHS,
+    _PROJECT_ROOT / "static/vrm/motion/player.js",
     *_TUTORIAL_RUNTIME_ASSET_PATHS,
     *_TEMPLATE_STATIC_ASSET_VERSION_PATHS,
 )
