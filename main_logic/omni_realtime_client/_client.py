@@ -141,6 +141,21 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self.get_host_turn_id = get_host_turn_id
         self.extra_event_handlers = extra_event_handlers or {}
         self._bg_tasks: set = set()  # 防止 fire-and-forget 任务被 GC 回收
+        # Teardown owns the socket it detached, so a cancelled caller cannot
+        # strand it. Both close paths run as one task per connection and every
+        # caller awaits it through a shield: cancelling the caller stops the
+        # waiting, never the closing, and a retry re-awaits the same task
+        # instead of finding ``self.ws`` already None and returning happy.
+        # Reset by connect(), because the client object outlives a connection.
+        self._close_task = None
+        self._failed_transport_close_task = None
+        self._gemini_close_task = None
+        # Bumped when a replacement connection attaches. A teardown that
+        # outlived its caller compares it after every await: the socket it
+        # detached is still its own to close, but client-wide state (silence
+        # scalars, the shared audio processor, the Gemini session) belongs to
+        # whoever attached last.
+        self._connection_generation = 0
 
         # Track current response state
         self._current_response_id = None

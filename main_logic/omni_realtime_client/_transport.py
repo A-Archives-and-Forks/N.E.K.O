@@ -182,6 +182,7 @@ class _TransportMixin:
         # end_session 协程挂住数百毫秒~数秒（Qwen 回 CLOSE 帧偶尔很慢），
         # 超时后 websockets 内部会 transport.abort() 强制关闭。
         self.ws = await websockets.connect(url, additional_headers=headers, close_timeout=0.5)
+        self._on_connection_attached()
         # Do not reopen the arbiter until the replacement transport exists.
         # A failed reconnect must leave the prior shutdown state intact.
         self._response_arbiter.reset_connection_state()
@@ -2116,24 +2117,123 @@ class _TransportMixin:
             logger.error(f"Error in message handling: {str(e)}")
             raise
 
+    def _on_connection_attached(self) -> None:
+        """Mark a replacement connection as live and hand it the teardown latches.
+
+        A close task closes the socket it detached, so it is finished with the
+        previous connection's socket the moment a replacement is installed —
+        and a latched finished task would make the new connection's close a
+        no-op. This has to happen where the socket is assigned, not at the top
+        of connect(): a close landing in the connect await window would
+        otherwise run to completion against no socket at all, and the
+        replacement would attach behind an already-finished latch that every
+        later close() just re-awaits. No await between the assignment and this
+        call, so no third party can observe the pair half-applied.
+
+        The generation bump is the other half. An unfinished predecessor is not
+        cancelled — it owns the retired socket and must finish closing it — but
+        everything else it would touch (the silence scalars connect() just
+        primed, the shared audio processor, the Gemini session) is client-wide
+        state that now belongs to the replacement. Teardowns compare the
+        generation after each await and keep their hands off what is no longer
+        theirs.
+        """
+
+        self._connection_generation += 1
+        self._close_task = None
+        self._failed_transport_close_task = None
+        self._gemini_close_task = None
+
+    def _still_owns_connection(self, generation) -> bool:
+        """Whether the connection a teardown seized is still the client's.
+
+        The rule this expresses has to hold at EVERY await boundary inside a
+        teardown, not just the first: the teardown outlives its caller by
+        design, so a replacement can attach during any one of them, and from
+        that moment the client's shared state (the arbiter, the fatal flag, the
+        silence scalars, the audio processor, the Gemini session) is the
+        replacement's. What the teardown seized up front stays its own to
+        release; everything else it must leave alone. Any await added below is
+        a new place to ask this.
+        """
+
+        return self._connection_generation == generation
+
+    async def _own_teardown(self, slot: str, detach):
+        """Await a teardown that this client owns, not the caller.
+
+        Both close paths detach ``self.ws`` first and only then await the
+        arbiter shutdown — deliberately, so no ticket can outlive the socket.
+        That ordering also means a cancel landing in the middle takes the only
+        reference to a still-open socket with it: ``self.ws`` is already None,
+        so a retry closes nothing and reports success. Every real canceller is
+        internal (a hot-swap final task cancelled by a concurrent
+        start/end_session), so this is reachable without anyone injecting one.
+
+        Running the teardown as a task the client holds, and awaiting it
+        through ``shield``, separates the two: the caller's cancel stops the
+        waiting, the closing continues, and a later caller awaits the same
+        task rather than a fresh one against an emptied field.
+
+        ``detach`` is a plain function — called HERE, synchronously, before the
+        task exists. A coroutine's body does not run at ``create_task`` time,
+        so a detach written inside the teardown would be scheduled, not
+        performed: a connect() parked one await away can attach its
+        replacement and clear the latch first, and the teardown then wakes up
+        and closes the brand-new socket it finds in ``self.ws``. Detaching in
+        the caller's own step keeps the seizure exactly where it used to be,
+        back when close() was an ordinary coroutine. ``detach`` returns the
+        coroutine to run, with everything it seized already bound.
+        """
+
+        task = getattr(self, slot, None)
+        if task is None:
+            task = asyncio.create_task(detach())
+            setattr(self, slot, task)
+        await asyncio.shield(task)
+
     async def _close_failed_transport(self, reason: str) -> None:
         """Fail response tickets and atomically detach the failed socket."""
 
+        # Latched before the task starts: callers check this flag to stop
+        # sending on a socket that is on its way out, and a scheduling gap
+        # before the task's first line must not be a window where they still
+        # think the transport is healthy.
         self._fatal_error_occurred = True
+        await self._own_teardown(
+            "_failed_transport_close_task",
+            lambda: self._detach_for_failed_transport(reason),
+        )
+
+    def _detach_for_failed_transport(self, reason: str):
+        generation = self._connection_generation
         ws, self.ws = self.ws, None
-        response_arbiter = getattr(self, "_response_arbiter", None)
-        if response_arbiter is not None:
-            await response_arbiter.shutdown(reason)
-        await self._abort_failed_transport(reason, ws)
+        return self._close_failed_transport_impl(reason, generation, ws)
+
+    async def _close_failed_transport_impl(self, reason: str, generation, ws) -> None:
+        # The fatal flag is the retired connection's, and the wrapper has
+        # already set it. Re-asserting it here would re-condemn a replacement
+        # that attached in between — connect() clears the flag on purpose, and
+        # a live connection marked fatal rejects every later send.
+        if self._still_owns_connection(generation):
+            response_arbiter = getattr(self, "_response_arbiter", None)
+            if response_arbiter is not None:
+                # Shared across connections, and connect() has already reopened
+                # it for the replacement. Shutting it down now would fail the
+                # new connection's tickets over a socket that is fine.
+                await response_arbiter.shutdown(reason)
+        await self._abort_failed_transport(reason, ws, generation)
 
     async def _abort_failed_transport(
         self,
         reason: str,
         ws=_ATTACHED_TRANSPORT,
+        generation=None,
     ) -> None:
         """Detach, when needed, and physically close a failed raw WebSocket."""
 
-        self._fatal_error_occurred = True
+        if generation is None or self._still_owns_connection(generation):
+            self._fatal_error_occurred = True
         if ws is _ATTACHED_TRANSPORT:
             ws, self.ws = self.ws, None
         if ws is not None:
@@ -2148,22 +2248,68 @@ class _TransportMixin:
 
     async def close(self) -> None:
         """Close the WebSocket connection."""
+        await self._own_teardown("_close_task", self._detach_for_close)
+
+    def _detach_for_close(self):
+        """Seize this connection's resources, then hand them to the teardown.
+
+        Synchronous on purpose (see ``_own_teardown``), and it takes everything
+        the teardown will release in one uninterrupted step: the teardown
+        outlives its caller by design, so connect() is free to attach a
+        replacement while it is parked in the arbiter shutdown, and anything
+        re-read off the client after that point can already be the
+        replacement's. The Gemini context comes along for the same reason —
+        ``_connect_gemini()`` overwrites the field, and the retired SDK
+        connection would have no one left to exit it.
+        """
+
+        generation = self._connection_generation
         ws, self.ws = self.ws, None
+        silence_check_task, self._silence_check_task = self._silence_check_task, None
+        gemini_context = self._gemini_context_manager
+        gemini_close_task = self._gemini_close_task
+        return self._close_impl(
+            generation, ws, silence_check_task, gemini_context, gemini_close_task
+        )
+
+    async def _close_impl(
+        self,
+        generation,
+        ws,
+        silence_check_task,
+        gemini_context,
+        gemini_close_task,
+    ) -> None:
         response_arbiter = getattr(self, "_response_arbiter", None)
-        if response_arbiter is not None:
+        if response_arbiter is not None and self._still_owns_connection(generation):
+            # The arbiter is shared across connections, not owned by one. If a
+            # replacement attached between the caller's seizure and this task's
+            # first line, connect() has already reopened it — shutting it down
+            # here would fail the live connection's tickets while its socket
+            # stays perfectly healthy.
             await response_arbiter.shutdown("realtime client closed")
 
         # 取消静默检测任务
-        if self._silence_check_task:
-            self._silence_check_task.cancel()
+        if silence_check_task:
+            silence_check_task.cancel()
             try:
-                await self._silence_check_task
+                await silence_check_task
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 logger.error(f"Error cancelling silence check task: {e}")
-            finally:
-                self._silence_check_task = None
+
+        if not self._still_owns_connection(generation):
+            # A replacement attached while this teardown ran. Everything below
+            # is client-wide — the silence scalars connect() has just primed,
+            # the audio processor the new connection is already feeding, the
+            # Gemini session it installed — and none of it is ours to release.
+            # What we seized still is.
+            logger.info(
+                "Realtime close: a replacement connection attached; releasing only the retired connection"
+            )
+            await self._release_retired_connection(ws, gemini_context, gemini_close_task)
+            return
 
         # 重置静默超时相关状态
         self._silence_timeout_triggered = False
@@ -2180,13 +2326,49 @@ class _TransportMixin:
 
         # Wait for any executor-owned chunk to finish before releasing the
         # session's RNNoise native state and soxr streaming buffers.
-        await self._close_audio_processor()
+        await self._close_audio_processor(generation)
+
+        if not self._still_owns_connection(generation):
+            # Waiting for the audio lock is an await like any other, and this
+            # is the last one before the release below reads the client again:
+            # ``_close_gemini()`` would exit the replacement's context — the
+            # session a successful reconnect just installed.
+            logger.info(
+                "Realtime close: a replacement connection attached; releasing only the retired connection"
+            )
+            await self._release_retired_connection(ws, gemini_context, gemini_close_task)
+            return
 
         # Gemini uses different cleanup
         if self._is_gemini:
             await self._close_gemini()
             return
 
+        await self._release_retired_connection(ws, gemini_context, gemini_close_task)
+
+    async def _release_retired_connection(
+        self,
+        ws,
+        gemini_context=None,
+        gemini_close_task=None,
+    ) -> None:
+        """Physically release the connection a teardown seized."""
+
+        if self._is_gemini:
+            # A Gemini session is released through the context manager that
+            # opened it, not by closing a socket. On the replacement path that
+            # context is no longer reachable from the client — connect()
+            # overwrote the field — so the reference we seized is the only one
+            # left, and dropping it would leave the SDK connection open with
+            # nobody to exit it.
+            if gemini_close_task is not None:
+                # Already being exited by an in-flight teardown of its own
+                # (the proactive quarantine close); awaiting it is how we avoid
+                # a second __aexit__ on the same one-shot context.
+                await asyncio.shield(gemini_close_task)
+            elif gemini_context is not None:
+                await self._close_gemini_impl(gemini_context, ws)
+            return
         if ws:
             try:
                 # 连接时已设 close_timeout=0.5s：远端超时未回 CLOSE 帧时，
