@@ -66,6 +66,11 @@ class TurnMixin:
         # 重置音频重采样器状态（新轮次音频不应与上轮次连续）
         self.audio_resampler.clear()
         await self._clear_tts_pipeline()
+        # _tts_done_queued_for_turn 的权威清零已经在 _clear_tts_pipeline 入口、
+        # 与 __interrupt__ 入队同步完成（取消落在它内部的 sleep 上也不会留下
+        # "worker 已中断、记账还说已排队"的残留）。这里保留一次重复清零，兜底那
+        # ~20ms 窗口内被并发路径重新置 True 的情况；pending_until_ready 则由
+        # _clear_tts_pipeline 末尾与 tts_pending_chunks 成对清，这里同样是兜底。
         self._tts_done_queued_for_turn = False  # 新轮次重置 TTS 结束信号标记
         self._tts_done_pending_until_ready = False
         # 新一轮开始：清空上一轮 AI 文本累加器（即使上轮 turn end 已清过，
@@ -125,6 +130,20 @@ class TurnMixin:
         Resetting ``audio_resampler`` is safe because the next turn's audio
         is a fresh stream — keeping stale soxr state would only risk a
         boundary artefact at turn 2's first frame.
+
+        On the write order and cancellation (#2619): the flags are cleared
+        before the ``async with self.lock`` that rotates the sid, which looks
+        like it could be cancelled half-applied. It cannot. No holder of
+        ``self.lock`` anywhere in this package suspends while holding it, so
+        the lock is never observed held, so this acquire always takes the
+        uncontended fast path and never yields — and a cancellation therefore
+        lands either before this method is entered or after it has returned,
+        never between these writes. That property is the whole reason this
+        shape is safe, so it is enforced rather than assumed: see
+        CORE_LOCK_NO_AWAIT in ``scripts/check_core_contracts.py``. Adding an
+        ``await`` inside any of those blocks makes the lock contendable and
+        makes this window real; move the awaited work out of the block
+        instead of reordering the writes here.
         """
         if self._takeover_active:
             return
