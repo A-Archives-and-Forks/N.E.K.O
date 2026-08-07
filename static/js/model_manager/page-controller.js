@@ -1655,6 +1655,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         );
     }
 
+    function stageModelManagerPNGTuberPlacement(runtimeConfig) {
+        if (currentModelType !== 'pngtuber' || !runtimeConfig || !currentModelInfo) {
+            return false;
+        }
+        currentModelInfo.pngtuber = mergePNGTuberConfigForSave(
+            null,
+            currentModelInfo.pngtuber,
+            runtimeConfig
+        );
+        window.hasUnsavedChanges = true;
+        if (savePositionBtn) savePositionBtn.disabled = false;
+        markModelChangedForCardFacePrompt();
+        return true;
+    }
+
+    window.stageModelManagerPNGTuberPlacement = stageModelManagerPNGTuberPlacement;
+
     async function saveModelToCharacter(modelName, itemId = null, vrmAnimation = null) {
         let effectiveLive3dSubType = currentLive3dSubType || '';
 
@@ -2031,6 +2048,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else if (type !== 'live3d') {
             currentLive3dSubType = '';
         }
+        window._modelManagerCurrentLive3dSubType = currentLive3dSubType;
         localStorage.setItem('modelType', type);
 
         // 无论后续初始化是否成功，都保证派发教程事件
