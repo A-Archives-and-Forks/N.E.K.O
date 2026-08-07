@@ -153,6 +153,7 @@ static/ziraitikuwa/*
 static/neko/*
 static/kemomimi/*
 static/yui/*
+static/yui-lolita/*
 static/react/neko-chat/*
 打包说明.txt
 runtime_hook_inflect.py
