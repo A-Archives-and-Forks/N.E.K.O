@@ -198,6 +198,20 @@ async function _hydrateCharacterLanguagePreference(name, select, selectUi) {
     }
 }
 
+function _distrustCachedLanguageBeforeRehydration(name) {
+    // The cached value is about to be superseded or is already unverified, and
+    // the authoritative re-read may itself fail (same outage). Leaving the old
+    // localStorage entry trusted lets a later websocket read it via
+    // getExplicitConversationLanguagePreference and persist it back, undoing the
+    // write we deliberately refused to cache. Successful hydration re-publishes
+    // the value and clears this marker.
+    try {
+        if (typeof window.markConversationLanguagePreferenceUntrusted === 'function') {
+            window.markConversationLanguagePreferenceUntrusted(name);
+        }
+    } catch (_) { /* hydration still runs */ }
+}
+
 async function _saveCharacterLanguagePreference(name, select, selectUi) {
     const previous = select.dataset.previousValue || select.value;
     const language = select.value;
@@ -219,10 +233,49 @@ async function _saveCharacterLanguagePreference(name, select, selectUi) {
         // A cross-window event or a newer local request may have superseded this
         // response while it was in flight. Never roll back or cache stale data.
         if (select.dataset.languageSaveId !== saveId || select.value !== language) return;
+        // Only this endpoint's causal-order conflict means "re-read the state".
+        // Both servers also answer 409 for storage-limited startup and for the
+        // cloudsave maintenance fence; those persisted nothing, so they must
+        // fall through to the failure path below (roll back + report) instead
+        // of leaving an unsaved selection on screen.
+        if (
+            response.status === 409
+            && payload.error_code === 'language_preference_superseded'
+        ) {
+            // Designed race, not a failure: another window persisted a newer
+            // preference. Rolling back to this window's previous value would
+            // display a locale that is already stale, so re-read durable state.
+            showMessage(
+                _characterLanguageT(
+                    'character.languagePreferenceSuperseded',
+                    '已有更新的语言偏好生效，已为你刷新'
+                ),
+                'warning'
+            );
+            _distrustCachedLanguageBeforeRehydration(name);
+            await _hydrateCharacterLanguagePreference(name, select, selectUi);
+            return;
+        }
         const partialSave = response.ok && payload.partial_success === true;
         const durableSave = response.ok && (
             payload.success === true || payload.partial_success === true
         );
+        if (durableSave && payload.freshness_unverified === true) {
+            // The write landed, but the server could not confirm it is still the
+            // durable value. Publishing it to the cross-window cache could pin a
+            // stale preference that a later session would re-persist, so re-read
+            // instead of caching this response.
+            showMessage(
+                _characterLanguageT(
+                    'character.languagePreferenceUnverified',
+                    '语言偏好已保存，但暂时无法确认是否为最新'
+                ),
+                'warning'
+            );
+            _distrustCachedLanguageBeforeRehydration(name);
+            await _hydrateCharacterLanguagePreference(name, select, selectUi);
+            return;
+        }
         if (durableSave && payload.language === language) {
             select.dataset.previousValue = language;
             select.dataset.durableLanguagePreference = language;
