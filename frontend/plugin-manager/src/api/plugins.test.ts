@@ -14,6 +14,40 @@ describe('plugin hosted UI API', () => {
     getMock.mockReset()
   })
 
+  it('merges locale with existing plugin list parameters', async () => {
+    const { getPlugins } = await import('./plugins')
+
+    getPlugins('zh-CN', {
+      params: { source: 'local' },
+      timeout: 1000,
+    })
+
+    expect(getMock).toHaveBeenCalledWith('/plugins', {
+      params: { source: 'local', locale: 'zh-CN' },
+      timeout: 1000,
+    })
+  })
+
+  it('preserves URLSearchParams when merging locale', async () => {
+    const { getPlugins } = await import('./plugins')
+    const input = new URLSearchParams([
+      ['source', 'local'],
+      ['tag', 'one'],
+      ['tag', 'two'],
+    ])
+
+    getPlugins('zh-CN', { params: input })
+
+    const requestConfig = getMock.mock.calls[0]?.[1]
+    expect(requestConfig.params).toBeInstanceOf(URLSearchParams)
+    expect(Array.from(requestConfig.params.entries())).toEqual([
+      ['source', 'local'],
+      ['tag', 'one'],
+      ['tag', 'two'],
+      ['locale', 'zh-CN'],
+    ])
+  })
+
   it('silences initial hosted action errors while passing its timeout', async () => {
     postMock.mockResolvedValue({ ok: true })
     const { callPluginHostedSurfaceAction } = await import('./plugins')

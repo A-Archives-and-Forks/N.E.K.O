@@ -2,6 +2,7 @@
  * 插件相关 API
  */
 import { del, get, post } from './index'
+import type { AxiosRequestConfig } from 'axios'
 import type {
   PluginMeta,
   PluginStatusData,
@@ -16,14 +17,33 @@ import type {
 /**
  * 获取插件列表
  */
-export function getPlugins(locale?: string): Promise<{ plugins: PluginMeta[]; message: string }> {
-  return get('/plugins', locale ? { params: { locale } } : undefined)
+export function getPlugins(
+  locale?: string,
+  config?: AxiosRequestConfig & { preserveMessagesOn404?: boolean },
+): Promise<{ plugins: PluginMeta[]; message: string }> {
+  if (typeof URLSearchParams !== 'undefined' && config?.params instanceof URLSearchParams) {
+    const params = new URLSearchParams(config.params)
+    if (locale) params.set('locale', locale)
+    return get('/plugins', {
+      ...(config || {}),
+      params,
+    })
+  }
+
+  const params = {
+    ...(config?.params || {}),
+    ...(locale ? { locale } : {}),
+  }
+  return get('/plugins', {
+    ...(config || {}),
+    params,
+  })
 }
 
 /**
  * 刷新插件注册表
  */
-export function refreshPluginsRegistry(): Promise<{
+export function refreshPluginsRegistry(config?: AxiosRequestConfig & { preserveMessagesOn404?: boolean }): Promise<{
   success: boolean
   added: string[]
   updated: string[]
@@ -33,7 +53,7 @@ export function refreshPluginsRegistry(): Promise<{
   failed: Array<{ plugin_id: string; config_path: string; error: string }>
   scanned_count: number
 }> {
-  return post('/plugins/refresh')
+  return post('/plugins/refresh', undefined, config)
 }
 
 /**
