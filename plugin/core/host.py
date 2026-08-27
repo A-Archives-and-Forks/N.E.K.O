@@ -284,7 +284,7 @@ def _prepare_child_plugin_import_roots(logger: Any) -> None:
     """Expose Core itself without exposing shared plugin candidate roots."""
 
     try:
-        from plugin.settings import BUILTIN_PLUGIN_CONFIG_ROOT
+        from plugin.settings import BUILTIN_PLUGIN_CONFIG_ROOT, PLUGIN_CONFIG_ROOTS
     except Exception as exc:
         logger.debug("[Plugin Process] Failed to load plugin config roots: {}", exc)
         return
@@ -293,6 +293,18 @@ def _prepare_child_plugin_import_roots(logger: Any) -> None:
         builtin_root = BUILTIN_PLUGIN_CONFIG_ROOT.resolve()
     except Exception:
         builtin_root = BUILTIN_PLUGIN_CONFIG_ROOT
+
+    # A child process loads only the plugin selected by its config path. Remove
+    # any inherited candidate roots so sibling user/builtin plugins cannot
+    # shadow standard-library or third-party top-level modules.
+    for plugin_config_root in PLUGIN_CONFIG_ROOTS:
+        try:
+            import_root = plugin_config_root.resolve().parent
+        except Exception:
+            import_root = plugin_config_root.parent
+        value = str(import_root)
+        while value in sys.path:
+            sys.path.remove(value)
 
     repo_root = builtin_root.parent.parent
     if str(repo_root) not in sys.path:
@@ -355,7 +367,6 @@ def _ensure_plugins_namespace(plugin_root: Path, logger: Any) -> None:
     spec.submodule_search_locations = existing.__path__
     logger.debug("[Plugin Process] Cleared inherited plugins namespace search paths")
 
-
 def _evict_plugin_module_tree(plugin_module_path: str) -> None:
     """Remove one synthetic plugin package without disturbing its siblings."""
 
@@ -375,6 +386,74 @@ def _evict_plugin_module_tree(plugin_module_path: str) -> None:
         or getattr(bound_child, "__name__", None) == plugin_module_path
     ):
         delattr(parent_module, child_name)
+
+
+def evict_cached_plugin_modules(plugin_id: str) -> None:
+    """Invalidate both import aliases for one plugin after its files change."""
+
+    if not plugin_id or "." in plugin_id:
+        return
+    _evict_plugin_module_tree(f"plugins.{plugin_id}")
+    _evict_plugin_module_tree(f"plugin.plugins.{plugin_id}")
+    importlib.invalidate_caches()
+
+
+def _module_is_loaded_from_plugin_dir(module: Any, plugin_dir: Path) -> bool:
+    """Return whether an imported package already represents the selected source."""
+
+    loaded_file = getattr(module, "__file__", None)
+    if isinstance(loaded_file, str) and loaded_file:
+        try:
+            Path(loaded_file).resolve().relative_to(plugin_dir)
+            return True
+        except (OSError, ValueError):
+            pass
+    for loaded_path in getattr(module, "__path__", ()):
+        try:
+            if Path(loaded_path).resolve() == plugin_dir:
+                return True
+        except (OSError, TypeError, ValueError):
+            continue
+    return False
+
+
+def _evict_cached_plugin_source(module_path: str, config_path: Path, logger: Any) -> None:
+    """Remove an inherited same-ID package before importing the effective source."""
+
+    parts = module_path.split(".")
+    if len(parts) >= 2 and parts[0] == "plugins":
+        plugin_id = parts[1]
+    elif len(parts) >= 3 and parts[:2] == ["plugin", "plugins"]:
+        plugin_id = parts[2]
+    else:
+        return
+    try:
+        plugin_dir = config_path.resolve().parent
+    except OSError as exc:
+        logger.debug("[Plugin Process] Failed to resolve plugin directory for cache eviction: {}", exc)
+        return
+    if plugin_id != plugin_dir.name:
+        return
+
+    package_prefixes = (f"plugins.{plugin_id}", f"plugin.plugins.{plugin_id}")
+    loaded_tree = [
+        (name, loaded)
+        for name, loaded in tuple(sys.modules.items())
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in package_prefixes)
+    ]
+    if loaded_tree and all(
+        _module_is_loaded_from_plugin_dir(loaded, plugin_dir) for _name, loaded in loaded_tree
+    ):
+        return
+
+    evicted = [name for name, _loaded in loaded_tree]
+    for name in evicted:
+        sys.modules.pop(name, None)
+    if evicted:
+        logger.info(
+            "[Plugin Process] Evicted cached plugin package before source import: {}",
+            ", ".join(package_prefixes),
+        )
 
 
 def _import_current_plugin_from_config(module_path: str, config_path: Path, logger: Any) -> Any | None:
@@ -446,11 +525,17 @@ def _import_current_plugin_from_config(module_path: str, config_path: Path, logg
         module = importlib.util.module_from_spec(spec)
         sys.modules[plugin_module_path] = module
         setattr(sys.modules["plugins"], parts[1], module)
+        legacy_parent = importlib.import_module("plugin.plugins")
+        legacy_module_path = f"plugin.{plugin_module_path}"
+        _evict_plugin_module_tree(legacy_module_path)
+        sys.modules[legacy_module_path] = module
+        setattr(legacy_parent, parts[1], module)
         try:
             if spec.loader is not None:
                 spec.loader.exec_module(module)
         except Exception:
             _evict_plugin_module_tree(plugin_module_path)
+            _evict_plugin_module_tree(legacy_module_path)
             raise
 
     if len(parts) > 2:
@@ -470,6 +555,10 @@ def _import_plugin_module(module_path: str, config_path: Path | None, logger: An
     退化为普通 ``import_module`` 行为。
     """
 
+    if config_path is not None and (
+        module_path.startswith("plugins.") or module_path.startswith("plugin.plugins.")
+    ):
+        _evict_cached_plugin_source(module_path, config_path, logger)
     if config_path is not None and module_path.startswith("plugins."):
         configured_module = _import_current_plugin_from_config(
             module_path,
