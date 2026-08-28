@@ -156,6 +156,21 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self.get_host_turn_id = get_host_turn_id
         self.extra_event_handlers = extra_event_handlers or {}
         self._bg_tasks: set = set()  # 防止 fire-and-forget 任务被 GC 回收
+        # Tool handlers have narrower ownership than generic background work:
+        # their results belong to one connection and one user-turn scope.
+        self._tool_scope_generation = 0
+        # Some OpenAI-compatible proxies omit speech_started/stopped and only
+        # report the completed input transcript. Track whether server VAD has
+        # already advanced this input's tool scope so the transcript can fill
+        # that gap without advancing a normal provider's turn twice.
+        self._raw_speech_started_scope_pending_transcript = False
+        self._tool_tasks: set[asyncio.Task] = set()
+        # Tool tasks that can no longer produce a usable result, whatever
+        # retired them. Recorded rather than re-derived: see
+        # ``_retired_tool_tasks``.
+        self._retired_tool_task_set: set[asyncio.Task] = set()
+        self._tool_tasks_by_call_id: Dict[str, set[asyncio.Task]] = {}
+        self._cancelled_tool_call_ids: set[tuple[int, int, str]] = set()
         # Teardown owns the socket it detached, so a cancelled caller cannot
         # strand it. Both close paths run as one task per connection and every
         # caller awaits it through a shield: cancelling the caller stops the
@@ -165,6 +180,10 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._close_task = None
         self._failed_transport_close_task = None
         self._gemini_close_task = None
+        # A replacement can reset the connection-wide close latch while the
+        # retired Gemini context is still exiting. Keep a separate latch per
+        # context so every path joins the same one-shot ``__aexit__`` call.
+        self._gemini_context_close_tasks: dict[int, tuple[Any, asyncio.Task]] = {}
         # Bumped when a replacement connection attaches. A teardown that
         # outlived its caller compares it after every await: the socket it
         # detached is still its own to close, but client-wide state (silence
@@ -485,6 +504,7 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._proactive_inject_awaiting_outcome = False
         self._proactive_inject_outcome_token: Optional[str] = None
         self._gemini_proactive_outcome: Optional[tuple] = None
+        self._gemini_proactive_outcome_owner: Optional[tuple] = None
 
     def _create_audio_processor(self) -> AudioProcessor:
         """Create session-owned audio state, including native RNNoise state."""
