@@ -3498,63 +3498,6 @@ def test_jukebox_fuzzy_distance_stays_linear_in_candidate_length(mock_page: Page
 
 
 @pytest.mark.frontend
-def test_jukebox_close_preserves_playback_started_on_a_shared_player(mock_page: Page):
-    """#4: closing the panel must not stop playback started on a shared player.
-
-    Reusing ``music_ui``'s player creates no headless host, which used to make
-    hasHeadlessRuntime() permanently false.
-    """
-    setup_headless_jukebox_page(mock_page)
-
-    result = mock_page.evaluate(
-        """
-        async () => {
-          const J = window.Jukebox;
-          const shared = new window.APlayer({ volume: 1, audio: [] });
-          window.music_ui = { getMusicPlayerInstance: () => shared };
-
-          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
-          const startedOnShared = J.getPlayer() === shared;
-
-          let fullCloseEvents = 0;
-          window.addEventListener('neko:jukebox-full-close', () => { fullCloseEvents += 1; });
-
-          const wrapper = document.createElement('div');
-          wrapper.className = 'jukebox-wrapper';
-          wrapper.innerHTML = '<div class="jukebox-container"></div>';
-          document.body.appendChild(wrapper);
-          J.State.container = wrapper;
-          J.State.isOpen = true;
-
-          let stopped = 0;
-          const originalStop = J.stopPlayback;
-          J.stopPlayback = function(...args) { stopped += 1; return originalStop.apply(this, args); };
-          J.close();
-          J.stopPlayback = originalStop;
-
-          return {
-            startedOnShared,
-            stopped,
-            fullCloseEvents,
-            sharedDestroyed: shared.destroyed === true,
-            currentSong: J.State.currentSong && J.State.currentSong.id,
-            isRuntimeReady: J.State.isRuntimeReady
-          };
-        }
-        """
-    )
-
-    assert result == {
-        "startedOnShared": True,
-        "stopped": 0,
-        "fullCloseEvents": 0,
-        "sharedDestroyed": False,
-        "currentSong": "song1",
-        "isRuntimeReady": True,
-    }
-
-
-@pytest.mark.frontend
 def test_jukebox_close_preserves_playback_when_panel_opened_first(mock_page: Page):
     """#4, second half: panel opened first, then the control API reuses its player.
 
@@ -7209,3 +7152,83 @@ def test_jukebox_targetless_previous_leaves_the_music_playing(mock_page: Page):
     assert result["afterPlaying"] is True, result
     assert result["afterSong"] == "song1"
     assert result["audioPaused"] is False, result
+
+
+@pytest.mark.frontend
+def test_jukebox_close_tears_down_when_only_the_panel_was_used(mock_page: Page):
+    """A hand-driven panel must tear down on close, not be kept alive.
+
+    Only ensureRuntime() sets isRuntimeReady, and the panel path in open() never
+    calls it -- so a session the user drove by hand reaches close() with the
+    runtime not ready, and the preserve branch must not fire.  Preserving it
+    would leave music playing with no UI and the parts never unloading.
+
+    Deliberately does NOT fabricate isRuntimeReady: an earlier version of this
+    test set it to true so that hasHeadlessRuntime()'s headlessRuntimeRequested
+    check would be reached, and thereby claimed coverage of a state the app
+    cannot produce -- every caller that sets isRuntimeReady also sets the flag.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.loadSongData();
+
+          // 纯面板使用：建面板、建面板播放器、用户自己点了一首。
+          const wrapper = document.createElement('div');
+          wrapper.className = 'jukebox-wrapper';
+          wrapper.innerHTML = '<div class="jukebox-container"></div>';
+          document.body.appendChild(wrapper);
+          const style = document.createElement('style');
+          document.head.appendChild(style);
+          J.State.container = wrapper;
+          J.State.styleElement = style;
+          J.State.isOpen = true;
+          J.initPlayer({ headless: false });
+          await J.playSong('song1');
+
+          const before = {
+            // 全程没有任何 headless 指令，也没人调过 ensureRuntime：这就是
+            // 「用户自己开面板放歌」的真实状态。
+            headlessRuntimeRequested: J.State.headlessRuntimeRequested,
+            isRuntimeReady: J.State.isRuntimeReady,
+            playing: J.State.isPlaying
+          };
+
+          let fullCloseEvents = 0;
+          window.addEventListener('neko:jukebox-full-close', () => { fullCloseEvents += 1; });
+          let stopped = 0;
+          const originalStop = J.stopPlayback;
+          J.stopPlayback = function(...args) { stopped += 1; return originalStop.apply(this, args); };
+          J.close();
+          J.stopPlayback = originalStop;
+
+          return {
+            before,
+            stopped,
+            fullCloseEvents,
+            isPlaying: J.State.isPlaying,
+            currentSong: J.State.currentSong && J.State.currentSong.id,
+            songCount: J.State.songs.length,
+            playerDestroyed: window.__lastAPlayer.destroyed === true
+          };
+        }
+        """
+    )
+
+    assert result["before"] == {
+        "headlessRuntimeRequested": False,
+        "isRuntimeReady": False,
+        "playing": True,
+    }
+    # 手动开的面板：关闭就该停播、彻底拆除、通知卸载分片。
+    assert result["stopped"] == 1, result
+    assert result["fullCloseEvents"] == 1, result
+    assert result["isPlaying"] is False
+    assert result["currentSong"] is None
+    assert result["songCount"] == 0
+    # 这条不能省：上面几项在「只 stopPlayback、不 prepareForUnload」的回归下全都
+    # 照样成立，播放器却还活着。要证明走的是彻底拆除那条分支，只能看它死没死。
+    assert result["playerDestroyed"] is True
