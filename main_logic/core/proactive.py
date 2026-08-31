@@ -1549,7 +1549,12 @@ class ProactiveMixin:
                     callbacks_snapshot[:] = []
         except Exception as e:
             logger.warning("[%s] trigger_agent_callbacks error: %s", self.lanlan_name, e)
-            self.pending_agent_callbacks.extend(callbacks_snapshot)
+            # Filter into a local before extending: filter_deliverable_callbacks
+            # rebinds self.pending_agent_callbacks, and Python binds ``.extend``
+            # to the list that is current BEFORE the argument is evaluated — so
+            # extending inline would append the survivors to an orphaned list.
+            _requeue = self.filter_deliverable_callbacks(callbacks_snapshot)
+            self.pending_agent_callbacks.extend(_requeue)
         finally:
             # Runs after the except-path restore above, so the deferred tail
             # lands behind the prefix it was split from either way.
@@ -1870,7 +1875,11 @@ class ProactiveMixin:
                 # send its own fresh teaser).
                 if topic_hint_sent:
                     await self.send_cancel_topic_hint(turn_id=proactive_sid)
-                self.pending_agent_callbacks.extend(active_callbacks)
+                # Same evaluation-order trap as the trigger_agent_callbacks
+                # except path: filter into a local first, because the filter
+                # rebinds self.pending_agent_callbacks.
+                _requeue = self.filter_deliverable_callbacks(active_callbacks)
+                self.pending_agent_callbacks.extend(_requeue)
                 return False
 
     def _is_voice_session_active_or_starting(self) -> bool:
