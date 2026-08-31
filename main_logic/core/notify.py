@@ -249,7 +249,6 @@ class NotifyMixin:
                 or self.agent_flags.get("browser_use_enabled", False)
                 or self.agent_flags.get("user_plugin_enabled", False)
                 or self.agent_flags.get("openclaw_enabled", False)
-                or self.agent_flags.get("openfang_enabled", False)
             )
         )
 

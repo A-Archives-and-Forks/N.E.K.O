@@ -3033,7 +3033,6 @@
             "enabled": "{{name}} Enabled",
             "disabled": "{{name}} Disabled",
             "enableFailed": "{{name}} Enable Failed",
-            "openfang": "Her Desktop",
             "userPluginAdapting": "User Plugin (Developing)",
             "openclawConnect": "OpenClaw",
             "openclawGuide": "OpenClaw Setup Guide",
@@ -3163,8 +3162,7 @@
             "typeUserPlugin": "User Plugin",
             "typeComputerUse": "Computer Use",
             "typeBrowserUse": "Browser Control",
-            "typeMCP": "MCP Tool",
-            "typeOpenFang": "Her Desktop"
+            "typeMCP": "MCP Tool"
         }
     },
     "vrm": {
