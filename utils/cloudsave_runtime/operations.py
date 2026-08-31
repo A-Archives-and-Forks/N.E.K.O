@@ -1534,10 +1534,63 @@ def import_local_cloudsave_snapshot(
                 if relative_path not in staged_entries and target_path.exists():
                     delete_file_targets.add(target_path)
 
+        from utils.config_manager.migrations import (
+            _MIGRATION_WORKSPACE_PREFIX,
+        )
+
+        def _is_migration_workspace(path):
+            """The NAME, which is the one thing that cannot be forged.
+
+            A character name never begins with a dot -- a product rule, to be
+            enforced in ``validate_character_name`` as a follow-up -- and the
+            workspace prefix does. So the two namespaces do not overlap and
+            the name settles it.
+
+            Six rounds of findings landed on this exemption while it tried to
+            tell the namespaces apart with evidence instead: the prefix plus
+            a marker file, a held lock, a held lock on a regular file, the
+            ledger, the ledger or a held lock. Every one was the same shape,
+            because every piece of evidence is written AFTER the directory
+            exists and there is always a window in which the directory has
+            none. mkdtemp returns a name, and the name is enough.
+
+            The cost is that an abandoned workspace is not swept by the
+            import either. That is not the import's job: the migration
+            reclaims its own, by age and by ledger, which is where the
+            evidence belongs.
+            """
+            return path.name.startswith(_MIGRATION_WORKSPACE_PREFIX)
+
+
         memory_root = Path(config_manager.memory_dir)
         if memory_root.exists():
             for child in memory_root.iterdir():
-                if child.is_dir() and child.name not in imported_character_names:
+                if not child.is_dir():
+                    continue
+                if _is_migration_workspace(child):
+                    # A startup migration WORKSPACE, not stale runtime
+                    # data. When memory/ is a junction onto another
+                    # volume the migration has to stage inside it, and
+                    # this import can run while that copy is in flight --
+                    # so removing it here deletes a half-copied character
+                    # tree out from under the process writing it.
+                    #
+                    # Exempt because it is IN THE LEDGER. Four narrower
+                    # readings of the on-disk evidence were reported in
+                    # turn -- the prefix, the prefix plus a marker file, a
+                    # held lock, a held lock on a regular file -- and each
+                    # was a tighter guess at a question those shapes
+                    # cannot answer: a character may legally be named
+                    # ".mig-anything" and may hold a ".lock", so the very
+                    # data being swept can reproduce every one of them.
+                    #
+                    # The ledger is written immediately after mkdtemp and
+                    # before the workspace is used, so a workspace whose
+                    # lock is not claimed yet is already recorded; and a
+                    # character's stray marker never will be, however
+                    # firmly something holds it.
+                    continue
+                if child.name not in imported_character_names:
                     delete_dir_targets.add(child)
 
         recent_targets = {
@@ -1627,6 +1680,19 @@ def import_local_cloudsave_snapshot(
                         _cleanup_empty_parent_dirs(target_path, Path(config_manager.memory_dir))
 
                 for target_path in sorted(delete_dir_targets, key=lambda path: len(path.parts), reverse=True):
+                    # Asked AGAIN, because the answer can change after
+                    # enumeration. A cross-device migration that had returned
+                    # from mkdtemp() but not yet created and locked its marker
+                    # read as inactive when this set was built, and could
+                    # claim the workspace and begin copying during the
+                    # file-apply phase above -- which is long.
+                    #
+                    # This narrows the window rather than closing it: nothing
+                    # can be held across an rmtree. It is the same move the
+                    # migration's own publish steps make, re-checking one
+                    # statement before the irreversible one.
+                    if _is_migration_workspace(target_path):
+                        continue
                     if target_path.exists():
                         shutil.rmtree(target_path)
 
@@ -1664,6 +1730,15 @@ def import_local_cloudsave_snapshot(
                         reverse=True,
                     ):
                         target_path = record["target"]
+                        # Rollback has to ask the same question the deletion
+                        # loop does. A workspace recorded after enumeration is
+                        # skipped there but is still in backup_records, so an
+                        # unrelated failure elsewhere would have this restore a
+                        # stale backup over a tree another process is writing
+                        # -- and leave that migration's seed unavailable for
+                        # the session.
+                        if _is_migration_workspace(target_path):
+                            continue
                         if target_path.exists():
                             if target_path.is_dir():
                                 shutil.rmtree(target_path, ignore_errors=True)
