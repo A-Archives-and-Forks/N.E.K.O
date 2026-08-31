@@ -431,18 +431,63 @@ def _active_character_cors_headers(request: Request) -> dict[str, str] | None:
 
 @app.post("/api/card-drop/active-character")
 async def set_card_drop_active_character(request: Request, payload: dict):
-    """Apply supplied fields, dropping avatar payloads that belong to a prior name."""
+    """Apply fields and invalidate images when character/model identity changes."""
     if not _card_drop_mutation_origin_allowed(request):
         return JSONResponse({"detail": "origin_not_allowed"}, status_code=403)
     if not isinstance(payload, dict):
         return {"ok": True}
+    revision_alias = next(
+        (alias for alias in ("modelRevision", "model_revision") if alias in payload),
+        None,
+    )
+    if revision_alias is not None:
+        try:
+            incoming_revision = max(0, int(payload.get(revision_alias) or 0))
+        except (TypeError, ValueError):
+            incoming_revision = 0
+        try:
+            current_revision = max(
+                0, int(_card_drop_active_character.get("modelRevision") or 0)
+            )
+        except (TypeError, ValueError):
+            current_revision = 0
+        if incoming_revision < current_revision:
+            return {"ok": False, "stale": True}
+        _card_drop_active_character["modelRevision"] = incoming_revision
+    name_changed = False
     if "name" in payload:
         next_name = str(payload.get("name") or "")
-        if next_name != _card_drop_active_character.get("name", ""):
-            for avatar_field in ("dataUrl", "characterReferenceDataUrl"):
-                if avatar_field not in payload:
-                    _card_drop_active_character.pop(avatar_field, None)
+        name_changed = next_name != _card_drop_active_character.get("name", "")
         _card_drop_active_character["name"] = next_name
+
+    identity_changed = name_changed
+    model_type_supplied = "modelType" in payload or "model_type" in payload
+    model_key_supplied = "modelKey" in payload or "model_key" in payload
+    for stored_field, aliases in (
+        ("modelType", ("modelType", "model_type")),
+        ("modelKey", ("modelKey", "model_key")),
+    ):
+        supplied_alias = next((alias for alias in aliases if alias in payload), None)
+        if supplied_alias is None:
+            continue
+        next_value = str(payload.get(supplied_alias) or "")
+        if next_value != _card_drop_active_character.get(stored_field, ""):
+            identity_changed = True
+        _card_drop_active_character[stored_field] = next_value
+
+    if name_changed:
+        if not model_type_supplied:
+            _card_drop_active_character.pop("modelType", None)
+        if not model_key_supplied:
+            _card_drop_active_character.pop("modelKey", None)
+    elif model_type_supplied and identity_changed and not model_key_supplied:
+        # A type-only transition must not leave the prior model's key attached.
+        _card_drop_active_character.pop("modelKey", None)
+
+    if identity_changed:
+        for avatar_field in ("dataUrl", "characterReferenceDataUrl"):
+            if avatar_field not in payload:
+                _card_drop_active_character.pop(avatar_field, None)
     if "dataUrl" in payload:
         _card_drop_active_character["dataUrl"] = str(payload.get("dataUrl") or "")
     if "characterReferenceDataUrl" in payload:
@@ -481,6 +526,9 @@ async def get_card_drop_active_character(
     payload: dict[str, str] = {"name": name}
     if master_name:
         payload["master_name"] = master_name
+    if not used_fallback:
+        payload["modelType"] = _card_drop_active_character.get("modelType", "")
+        payload["modelKey"] = _card_drop_active_character.get("modelKey", "")
     if include_avatar and not used_fallback:
         payload["dataUrl"] = _card_drop_active_character.get("dataUrl", "")
         payload["characterReferenceDataUrl"] = _card_drop_active_character.get(
