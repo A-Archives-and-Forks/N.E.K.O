@@ -10,6 +10,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 from collections.abc import Mapping
+from functools import partial
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -39,7 +40,10 @@ from plugin.server.application.plugins.operation_lock import (
     PluginOperationBusy,
     serialized_plugin_operation,
 )
-from plugin.server.application.plugins.registry_service import PluginRegistryService
+from plugin.server.application.plugins.registry_service import (
+    PluginRegistryService,
+    config_overrides_packaged_entries,
+)
 from plugin.server.application.plugins.installation_transactions import (
     UninstallOwnershipError,
     UninstallPluginError,
@@ -50,9 +54,12 @@ from plugin.server.application.plugins.installation_transactions import (
 )
 from plugin.server.application.plugins.metadata_scanner import (
     _DEFAULT_SCAN_TIMEOUT_SECONDS as _DEFAULT_METADATA_SCAN_TIMEOUT,
+    _handler_key_belongs_to_plugin,
+    IsolatedPluginMetadata,
     install_isolated_plugin_metadata,
     scan_plugin_metadata_isolated,
 )
+from plugin.server.infrastructure.packaged_metadata import read_packaged_metadata
 from plugin.server.application.install_source import (
     InstallSourceError,
     get_install_source_manager,
@@ -76,20 +83,32 @@ from plugin.settings import (
     PLUGIN_STARTUP_TIMEOUT,
     PLUGIN_SYNC_AUTO_START_ON_TOGGLE,
 )
+from plugin.server.infrastructure.autostart_approvals import clear_autostart_pending
 from plugin.utils import parse_bool_config
 
 logger = get_logger("server.application.plugins.lifecycle")
 _PLUGIN_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _PLUGIN_STARTUP_TIMEOUT_MAX = 300.0
-# 被整轮预算压缩后，一次启动至少还能拿到这么久。
+# 被整轮预算压缩后，一步至少还能拿到这么久。
 #
 # 没有下界的话，预算见底时算出来的是 0 或负数，那等于"直接判这个插件启动失败"
 # 而不是"抓紧试一次"——而走到启动阶段的插件都是我们刚亲手停掉的，判它失败就是
-# 把它留在停止状态。
-_MIN_CLAMPED_STEP_TIMEOUT = 1.0
+# 把它留在停止状态；关停侧则会退化成直接杀进程而不是先请它自己收尾。
+#
+# 启动和关停各有各的下界。它们曾经共用一个数，而把启动的下界抬上去会连带把关停
+# 的最坏墙钟一起抬高——那是两件无关的事，一次改动不该同时动到。
+#
+# 启动 3.0 而不是 1.0：下界的意思是"至少给它一次真正的尝试"，而 1 秒买不到一次
+# 尝试。光是起子进程加导入框架，本机实测就要 0.74s（其中 0.38s 是 fastapi），插件
+# 自己的导入还没开始算。给一个必然超时的窗口，等于把健康插件在超支的那一轮记成
+# 启动失败。代价只落在已经超支的病态路径上：一轮 8 个插件最坏多花 16 秒，而正常
+# 一轮根本走不到这里。
+_MIN_CLAMPED_START_TIMEOUT = 3.0
+# 关停保持 1.0：这一步不起进程，它只是给插件一个说"我收好了"的机会。
 # 清理远端工具表这一步在没有预算约束时愿意花的时间（它自己内部还有更细的超时）。
 _CLEAR_TOOLS_BUDGET_SECONDS = 2.0
-# 预算见底时仍然留给它的一小段时间。不是"启动尝试"那种下界（那是 1.0s），
+# 预算见底时仍然留给它的一小段时间。不是"启动尝试"那种下界（那是
+# _MIN_CLAMPED_START_TIMEOUT），
 # 只是让这次幂等的远端清除**发得出去**——跳过的代价是永久的幽灵工具，而这
 # 一小段的代价只在 main_server 真的卡住时才付。
 _MIN_TOOL_CLEANUP_TIMEOUT = 0.25
@@ -111,7 +130,85 @@ def _resolve_python_requirements(
     return requirements, paths, missing
 
 
-def _clamp_step_timeout(configured: float, budget: float | None) -> float:
+_MIN_CLAMPED_STOP_TIMEOUT = 1.0
+
+
+def _read_packaged_isolated_metadata(
+    config_path: Path,
+    plugin_id: str,
+    *,
+    conf: object = None,
+    pdata: object = None,
+) -> IsolatedPluginMetadata | None:
+    """Reuse the packaging-time metadata instead of importing the plugin again.
+
+    Starting a plugin already imports it once — inside the plugin process. The
+    metadata worker was a *second* import of the same code, for a result the
+    package already carries (codex). When the package has valid metadata, read
+    it; otherwise fall back to the worker so a hand-dropped or dev-mode plugin
+    still gets its entries.
+
+    ⚠️ Handler keys embed the plugin id (``"<pid>.<entry>"``), and the id a
+    plugin runs under is not always the one its manifest declares — an id
+    conflict renames it. ``install_isolated_plugin_metadata`` drops every key
+    that does not belong to the runtime id, so handing it packaged keys minted
+    under a different id registers *nothing*: the plugin starts, reports
+    success, and exposes no entries at all (coderabbit). Fall back to the
+    worker in that case, since it mints keys under the id we pass it.
+
+    An empty ``handlers`` mapping is an answer, not a gap: a background-only
+    plugin registers no entries, and schema v3 always writes the key. Treating
+    empty as "no metadata" sent exactly those plugins back through the worker —
+    one import for the scan, one for the host, so any module-level side effect
+    (writing state, sending a notification, launching a helper) happened twice
+    (codex). There is no older package to protect: the version gate above only
+    accepts v3, and v1/v2 were never released.
+
+    Returns ``None`` when there is no usable metadata at all.
+    """
+    packaged = read_packaged_metadata(Path(config_path).parent)
+    if packaged is None:
+        return None
+    if config_overrides_packaged_entries(conf, pdata, packaged):
+        # 打包期读的是暂存目录那份 plugin.toml，看不到用户的运行时配置/激活
+        # profile。生效配置一旦改过 entries 表，包里那份 handler 就不是这台机器上
+        # 该注册的那一套了（codex）。这种插件回落到真扫一次。
+        return None
+    if not packaged.built_in_this_environment:
+        # 这一份是别的机器上 import 出来的结果。插件完全可以按 sys.platform 或
+        # Python 版本条件注册入口，那样的话包里那套 handler 描述的是打包机的能力
+        # 集，不是这台机器的（codex）。展示用的 entries 可以将就，但注册进
+        # state.event_handlers 的这份是权威能力集——它错了，模型会去调一个这台机器
+        # 上根本不存在的入口。回落到真扫一次，代价就是本 PR 之前的原样。
+        logger.info(
+            "packaged metadata was produced in a different environment; "
+            "rescanning so the registered entries match this machine: "
+            "plugin_id={}",
+            plugin_id,
+        )
+        return None
+    if not all(
+        _handler_key_belongs_to_plugin(key, plugin_id) for key in packaged.handlers
+    ):
+        logger.info(
+            "packaged handler keys were minted under a different plugin id; "
+            "rescanning so they match the runtime id: plugin_id={}",
+            plugin_id,
+        )
+        return None
+    return IsolatedPluginMetadata(
+        entries_preview=list(packaged.entries),
+        handlers=dict(packaged.handlers),
+        entry_methods=dict(packaged.entry_methods),
+    )
+
+
+def _clamp_step_timeout(
+    configured: float,
+    budget: float | None,
+    *,
+    floor: float,
+) -> float:
     """Fit one step of a stop or a start inside what is left of a round budget.
 
     Never *widens*: a plugin that declared a 0.5 s timeout of its own keeps it
@@ -124,7 +221,7 @@ def _clamp_step_timeout(configured: float, budget: float | None) -> float:
     """
     if budget is None:
         return configured
-    return min(configured, max(_MIN_CLAMPED_STEP_TIMEOUT, budget))
+    return min(configured, max(floor, budget))
 
 
 def _remaining_step_budget(deadline: float | None) -> float | None:
@@ -176,6 +273,39 @@ def _persist_user_runtime_intent(
             },
             log_level="error",
         ) from exc
+
+    if enabled:
+        # 清在偏好写盘**之后**。写盘失败会抛上去、只被报成 partial_success，而这台
+        # 机器上就没有用户 override 了——重启后注册表回落到 manifest 默认值
+        # （enabled/auto_start 都是 true）。先清的话，等于凭一个没落地的意图永久发出
+        # 了自启动批准（greptile）。
+        #
+        # 这是 autostart_approvals 那条"一切失败都朝着照常自启"原则的例外，而且不
+        # 冲突：那条原则说的是**读**不出记录时别把用户现有的自启动关掉；这里是**写**，
+        # 而待批准记录只存在于新装插件上——它们本来就没自启过，写失败时不批准，
+        # 回到的正是安装前的状态。
+        persisted = clear_autostart_pending(plugin_id)
+        # 改名前的那些 id 一起清。安装时按 manifest 声明的 id 记待批准，而插件可能
+        # 因为 id 冲突以另一个运行时 id 注册；只清运行时 id 的话，等冲突消失、它又
+        # 用回声明 id 时，那条残留记录会继续挡着它自启（coderabbit）。
+        for previous_plugin_id in previous_plugin_ids:
+            persisted = clear_autostart_pending(previous_plugin_id) and persisted
+        if not persisted:
+            # 批准没落地就不能报成"偏好已保存"。运行时偏好那一半确实写成了，但插件
+            # 仍然留在待批准集合里，重启后自启动筛选会再一次静默把它拦下来，而用户
+            # 手上没有任何线索（greptile）。走和偏好写失败同一条上报通道：调用方把它
+            # 降级成 partial_success，而不是让这次启动失败。
+            raise ServerDomainError(
+                code="PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED",
+                message="PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED",
+                status_code=500,
+                details={
+                    "plugin_id": plugin_id,
+                    "error_type": "AutostartApprovalPersistenceError",
+                    "runtime_state_changed": runtime_state_changed,
+                },
+                log_level="error",
+            )
 
 
 def _mark_preference_persistence_failure(
@@ -959,6 +1089,50 @@ class PluginLifecycleService:
                         error_type="DependencyCheckFailed",
                     )
 
+            # 元数据在 host 起来**之前**取。取法有两种：包里带了就直接读，没有才
+            # 起一次隔离 worker 去 import。
+            #
+            # ⚠️ 顺序是承重的。放在 host 起来之后的话，那次 import 和插件进程自己
+            # 那次是并发的：模块级代码里拿文件锁、绑端口、起单例的插件会在第二次
+            # import 上失败，于是生命周期清理把一个健康的 host 杀掉、把这次启动报成
+            # 失败；没有直接冲突的插件也会把 import 期副作用执行两遍（codex）。
+            # 本 PR 之前这条路是安全的，因为扫描发生在 refresh_plugin 里、早于
+            # host 启动——刷新不再扫描之后，得在这里把那个顺序还回来。
+            #
+            # 上限按剩余预算收窄：扫描自己的上限是 10s，只钳住 host 启动的话，一次
+            # 冷扫描就能把整轮 reload 的墙钟顶穿（CodeRabbit）。
+            module_path, class_name = entry.split(":", 1)
+            isolated_metadata = await asyncio.to_thread(
+                partial(
+                    _read_packaged_isolated_metadata,
+                    config_path,
+                    current_plugin_id,
+                    conf=conf,
+                    pdata=pdata,
+                )
+            )
+            if isolated_metadata is None:
+                # 预算在读完包内元数据之后才算。读那一步自己可能要哈希一整棵改过的
+                # 树，然后才回落——在它前面算出来的上限是过期快照，worker 还会拿到
+                # 接近 10s 的额度，整轮 reload 就会超出对外承诺的墙钟（codex）。
+                # 和下面 startup_timeout_value 的重算是同一条判据。
+                scan_timeout = _clamp_step_timeout(
+                    _DEFAULT_METADATA_SCAN_TIMEOUT,
+                    _remaining_step_budget(start_deadline),
+                    floor=_MIN_CLAMPED_START_TIMEOUT,
+                )
+                isolated_metadata = await asyncio.to_thread(
+                    scan_plugin_metadata_isolated,
+                    plugin_id=current_plugin_id,
+                    module_path=module_path,
+                    class_name=class_name,
+                    config_path=config_path,
+                    conf=conf,
+                    pdata=pdata,
+                    python_requirement_paths=python_requirement_paths,
+                    timeout=scan_timeout,
+                )
+
             if start_deadline is not None and startup_timeout_value is not None:
                 # reload-all 把本轮的截止期压进来。只在启动**开始前**检查一次是不
                 # 够的：一个在截止期前一瞬开始的启动，之后仍会一路等到它自己的
@@ -968,9 +1142,19 @@ class PluginLifecycleService:
                 # 压进去而不是套 asyncio.wait_for：start_plugin 带
                 # @serialized_plugin_operation，那个包装器拿到锁之后会屏蔽取消，
                 # 外面套超时只会把一次真实结果报成超时（见 stop 那边的说明）。
+                #
+                # ⚠️ 必须算在取元数据**之后**。取元数据现在排在 host 启动前面，它自己
+                # 最多要花一个 scan_timeout；在它前面算出来的上限，等真正调
+                # _start_host_with_timeout 时已经是过期快照，于是启动阶段的墙钟会比
+                # 设计值多出"每个插件一次扫描"——正是这段钳位本来要防的那件事
+                # （coderabbit）。_remaining_step_budget 按绝对截止期算，挪到这里重算
+                # 就是对的。
                 startup_timeout_value = _clamp_step_timeout(
-                    startup_timeout_value, _remaining_step_budget(start_deadline)
+                    startup_timeout_value,
+                    _remaining_step_budget(start_deadline),
+                    floor=_MIN_CLAMPED_START_TIMEOUT,
                 )
+
             startup_result = await _start_host_with_timeout(
                 plugin_id=current_plugin_id,
                 host_obj=host_obj,
@@ -997,27 +1181,6 @@ class PluginLifecycleService:
                         error_type="ProcessDiedImmediately",
                     )
 
-            module_path, class_name = entry.split(":", 1)
-            # 元数据扫描排在 host 起来**之后**，而它自己的上限是 10s：只钳住 host
-            # 启动的话，一次冷扫描就能把整轮 reload 的墙钟顶穿，而那正是这个预算
-            # 要管的事（CodeRabbit）。所以这一步也按剩余预算收窄。
-            #
-            # 正常一轮 reload 走到这里是命中缓存的（注册表刚刷过、指纹没变），代价
-            # 接近零；钳位只在冷扫描那条病态路径上真的生效。
-            scan_timeout = _clamp_step_timeout(
-                _DEFAULT_METADATA_SCAN_TIMEOUT, _remaining_step_budget(start_deadline)
-            )
-            isolated_metadata = await asyncio.to_thread(
-                scan_plugin_metadata_isolated,
-                plugin_id=current_plugin_id,
-                module_path=module_path,
-                class_name=class_name,
-                config_path=config_path,
-                conf=conf,
-                pdata=pdata,
-                python_requirement_paths=python_requirement_paths,
-                timeout=scan_timeout,
-            )
             await asyncio.to_thread(
                 install_isolated_plugin_metadata,
                 current_plugin_id,
@@ -1161,7 +1324,9 @@ class PluginLifecycleService:
                     PLUGIN_SHUTDOWN_TIMEOUT
                     if stop_deadline is None
                     else _clamp_step_timeout(
-                        PLUGIN_SHUTDOWN_TIMEOUT, _remaining_step_budget(stop_deadline)
+                        PLUGIN_SHUTDOWN_TIMEOUT,
+                        _remaining_step_budget(stop_deadline),
+                        floor=_MIN_CLAMPED_STOP_TIMEOUT,
                     )
                 )
             )
@@ -1284,7 +1449,10 @@ class PluginLifecycleService:
                 if error.status_code != 404:
                     raise
 
-        result = await self.start_plugin(plugin_id)
+        # reload 是用户按的按钮，而前端在插件停着的时候也给这个按钮。用它把一个
+        # 待批准的插件启动起来，和用 start 启动是同一件事，批准位一样要清掉——否则
+        # 那个插件永远启动得起来、却永远不自启（codex）。
+        result = await self.start_plugin(plugin_id, persist_user_intent=True)
         _emit_lifecycle_event(event_type="plugin_reloaded", plugin_id=plugin_id)
         return result
 
@@ -1420,7 +1588,7 @@ class PluginLifecycleService:
             #
             # 停止侧不需要这个下界，而且那是刻意的：停止侧等不到锁，插件还好好跑着。
             remaining = max(
-                _MIN_CLAMPED_STEP_TIMEOUT, start_deadline - time_module.monotonic()
+                _MIN_CLAMPED_START_TIMEOUT, start_deadline - time_module.monotonic()
             )
             with bounded_operation_wait(remaining):
                 outcome = await self._safe_start_for_reload(
