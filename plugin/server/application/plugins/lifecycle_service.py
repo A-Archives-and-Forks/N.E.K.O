@@ -12,7 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from fastapi import HTTPException
 
@@ -34,7 +34,11 @@ from plugin.core.state import state
 from plugin.logging_config import get_logger
 from plugin.server.domain import IO_RUNTIME_ERRORS, RUNTIME_ERRORS
 from plugin.server.domain.errors import ServerDomainError
-from plugin.server.application.plugins.operation_lock import serialized_plugin_operation
+from plugin.server.application.plugins.operation_lock import (
+    bounded_operation_wait,
+    PluginOperationBusy,
+    serialized_plugin_operation,
+)
 from plugin.server.application.plugins.registry_service import PluginRegistryService
 from plugin.server.application.plugins.installation_transactions import (
     UninstallOwnershipError,
@@ -45,6 +49,7 @@ from plugin.server.application.plugins.installation_transactions import (
     uninstall_plugin,
 )
 from plugin.server.application.plugins.metadata_scanner import (
+    _DEFAULT_SCAN_TIMEOUT_SECONDS as _DEFAULT_METADATA_SCAN_TIMEOUT,
     install_isolated_plugin_metadata,
     scan_plugin_metadata_isolated,
 )
@@ -76,6 +81,62 @@ from plugin.utils import parse_bool_config
 logger = get_logger("server.application.plugins.lifecycle")
 _PLUGIN_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _PLUGIN_STARTUP_TIMEOUT_MAX = 300.0
+# 被整轮预算压缩后，一次启动至少还能拿到这么久。
+#
+# 没有下界的话，预算见底时算出来的是 0 或负数，那等于"直接判这个插件启动失败"
+# 而不是"抓紧试一次"——而走到启动阶段的插件都是我们刚亲手停掉的，判它失败就是
+# 把它留在停止状态。
+_MIN_CLAMPED_STEP_TIMEOUT = 1.0
+# 清理远端工具表这一步在没有预算约束时愿意花的时间（它自己内部还有更细的超时）。
+_CLEAR_TOOLS_BUDGET_SECONDS = 2.0
+# 预算见底时仍然留给它的一小段时间。不是"启动尝试"那种下界（那是 1.0s），
+# 只是让这次幂等的远端清除**发得出去**——跳过的代价是永久的幽灵工具，而这
+# 一小段的代价只在 main_server 真的卡住时才付。
+_MIN_TOOL_CLEANUP_TIMEOUT = 0.25
+
+
+def _resolve_python_requirements(
+    conf: Any,
+    config_path: Path,
+    plugin_id: str,
+) -> tuple[list[str], list[Path], list[str]]:
+    """Read a plugin's declared Python deps and check them against its vendor dir.
+
+    三步全是磁盘 I/O：读 pyproject.toml、列出 vendor/ 下每个 dist-info、逐个读它们
+    的 METADATA。合成一个函数只是为了让调用方能一次 to_thread 掉，见 start_plugin。
+    """
+    requirements = _collect_plugin_python_requirements(conf, config_path, logger, plugin_id)
+    paths = _collect_plugin_python_requirement_paths(config_path)
+    missing = _find_missing_python_requirements(requirements, search_paths=paths)
+    return requirements, paths, missing
+
+
+def _clamp_step_timeout(configured: float, budget: float | None) -> float:
+    """Fit one step of a stop or a start inside what is left of a round budget.
+
+    Never *widens*: a plugin that declared a 0.5 s timeout of its own keeps it
+    however generous the budget is, and however low the floor is. The floor
+    raises a squeezed budget, it does not raise the configured value.
+
+    One helper for both phases on purpose. The stop side had no floor at all,
+    so a spent budget handed ``shutdown_timeout≈0`` down and every remaining
+    plugin was killed outright instead of being asked to shut down.
+    """
+    if budget is None:
+        return configured
+    return min(configured, max(_MIN_CLAMPED_STEP_TIMEOUT, budget))
+
+
+def _remaining_step_budget(deadline: float | None) -> float | None:
+    """Seconds left before ``deadline``, or ``None`` when the step is unbounded.
+
+    A start is several sequential expensive steps, not one. Handing the whole
+    call a single duration bounds only the step it is applied to and lets every
+    other step run past the round's wall clock; recomputing against an absolute
+    deadline is what makes the budget cover the call rather than one line of it
+    (CodeRabbit).
+    """
+    return None if deadline is None else deadline - time_module.monotonic()
 plugin_registry_service = PluginRegistryService()
 def _persist_user_runtime_intent(
     plugin_id: str,
@@ -580,6 +641,18 @@ async def _start_host_with_timeout(
         raise
 
 
+# reload-all 停止阶段的墙钟预算。
+#
+# 每个插件的 stop 都要独立抢一次跨进程锁（见下面 reload_all_plugins 里的说明：
+# 这一段无法真并行），所以耗时随插件数线性增长，而前端只等 30s。超预算就停下，
+# 已经停掉的照常汇报，剩下的留在原地——比让整个请求超时、而操作又在后台继续
+# 落地要好。
+# Env: NEKO_PLUGIN_RELOAD_ALL_BUDGET
+from plugin.server.application.plugins._env_budgets import env_seconds
+
+_RELOAD_ALL_BUDGET_SECONDS = env_seconds("NEKO_PLUGIN_RELOAD_ALL_BUDGET", 20.0)
+
+
 class PluginLifecycleService:
     @serialized_plugin_operation
     async def start_plugin(
@@ -589,6 +662,7 @@ class PluginLifecycleService:
         *,
         refresh_registry: bool = True,
         persist_user_intent: bool = False,
+        start_deadline: float | None = None,
     ) -> dict[str, object]:
         start_time = time_module.perf_counter()
         original_plugin_id = plugin_id
@@ -823,16 +897,26 @@ class PluginLifecycleService:
                     error_type="DuplicatePlugin",
                 )
             current_plugin_id = resolved_id
-            python_requirements = _collect_plugin_python_requirements(
+            # 这一步是真正的磁盘 I/O，而且原本直接跑在事件循环线程上：一个 200
+            # 个分发包的 vendor 目录冷读实测 0.31s、600 个 0.97s（Windows 本机；
+            # 热读分别是 45ms / 184ms），整个服务器在这期间不响应任何请求
+            # （Greptile）。挪进线程——它周围每一步本来就是这么做的（建 host、
+            # 元数据扫描、运行时元数据落盘）。
+            #
+            # 不给它套超时。这是一道**前置闸门**，不是可以缩短的步骤：超时之后
+            # 只剩两条路，蒙着头启动（缺依赖的进程起来就死，代价是一次完整的子
+            # 进程 spawn，更贵），或者判它依赖缺失（把好插件误报成硬失败，最坏）。
+            # 它花掉的时间本来就落在预算里——_remaining_step_budget 在它**之后**
+            # 才取，所以后面每一步的上限已经被它扣减过了。
+            (
+                python_requirements,
+                python_requirement_paths,
+                unsatisfied_python_requirements,
+            ) = await asyncio.to_thread(
+                _resolve_python_requirements,
                 conf,
                 config_path,
-                logger,
                 current_plugin_id,
-            )
-            python_requirement_paths = _collect_plugin_python_requirement_paths(config_path)
-            unsatisfied_python_requirements = _find_missing_python_requirements(
-                python_requirements,
-                search_paths=python_requirement_paths,
             )
             if unsatisfied_python_requirements:
                 raise _to_domain_error(
@@ -875,6 +959,18 @@ class PluginLifecycleService:
                         error_type="DependencyCheckFailed",
                     )
 
+            if start_deadline is not None and startup_timeout_value is not None:
+                # reload-all 把本轮的截止期压进来。只在启动**开始前**检查一次是不
+                # 够的：一个在截止期前一瞬开始的启动，之后仍会一路等到它自己的
+                # startup timeout，于是整轮 reload 照样冲破对外承诺的墙钟，前端早已
+                # 放弃而插件状态还在被改（codex / CodeRabbit / Greptile）。
+                #
+                # 压进去而不是套 asyncio.wait_for：start_plugin 带
+                # @serialized_plugin_operation，那个包装器拿到锁之后会屏蔽取消，
+                # 外面套超时只会把一次真实结果报成超时（见 stop 那边的说明）。
+                startup_timeout_value = _clamp_step_timeout(
+                    startup_timeout_value, _remaining_step_budget(start_deadline)
+                )
             startup_result = await _start_host_with_timeout(
                 plugin_id=current_plugin_id,
                 host_obj=host_obj,
@@ -902,6 +998,15 @@ class PluginLifecycleService:
                     )
 
             module_path, class_name = entry.split(":", 1)
+            # 元数据扫描排在 host 起来**之后**，而它自己的上限是 10s：只钳住 host
+            # 启动的话，一次冷扫描就能把整轮 reload 的墙钟顶穿，而那正是这个预算
+            # 要管的事（CodeRabbit）。所以这一步也按剩余预算收窄。
+            #
+            # 正常一轮 reload 走到这里是命中缓存的（注册表刚刷过、指纹没变），代价
+            # 接近零；钳位只在冷扫描那条病态路径上真的生效。
+            scan_timeout = _clamp_step_timeout(
+                _DEFAULT_METADATA_SCAN_TIMEOUT, _remaining_step_budget(start_deadline)
+            )
             isolated_metadata = await asyncio.to_thread(
                 scan_plugin_metadata_isolated,
                 plugin_id=current_plugin_id,
@@ -911,6 +1016,7 @@ class PluginLifecycleService:
                 conf=conf,
                 pdata=pdata,
                 python_requirement_paths=python_requirement_paths,
+                timeout=scan_timeout,
             )
             await asyncio.to_thread(
                 install_isolated_plugin_metadata,
@@ -1022,6 +1128,7 @@ class PluginLifecycleService:
         plugin_id: str,
         *,
         persist_user_intent: bool = False,
+        stop_deadline: float | None = None,
     ) -> dict[str, object]:
         host_obj = await asyncio.to_thread(_get_plugin_host_sync, plugin_id)
         if host_obj is None:
@@ -1044,7 +1151,20 @@ class PluginLifecycleService:
 
         try:
             _emit_lifecycle_event(event_type="plugin_stop_requested", plugin_id=plugin_id)
-            await host_obj.shutdown(timeout=PLUGIN_SHUTDOWN_TIMEOUT)
+            # 剩余预算在这里算，不在调用方那边算。这个函数体是在
+            # @serialized_plugin_operation 拿到锁**之后**才跑的，所以此刻的"还剩
+            # 多少"才是真的；在外面算的话，一次等了 19s 锁的关停照样会拿到按 20s
+            # 算出来的上限，停止阶段就此冲破对外承诺的墙钟（codex）。和启动侧收
+            # start_deadline 是同一个形状。
+            await host_obj.shutdown(
+                timeout=(
+                    PLUGIN_SHUTDOWN_TIMEOUT
+                    if stop_deadline is None
+                    else _clamp_step_timeout(
+                        PLUGIN_SHUTDOWN_TIMEOUT, _remaining_step_budget(stop_deadline)
+                    )
+                )
+            )
             await asyncio.to_thread(_pop_plugin_host_sync, plugin_id)
             await asyncio.to_thread(_remove_event_handlers_sync, plugin_id)
             # Clear any LLM tools the plugin had registered with
@@ -1056,10 +1176,56 @@ class PluginLifecycleService:
             # model could still pick them only to hit a 404 on
             # dispatch.
             try:
-                await clear_plugin_llm_tools(plugin_id)
+                # 这一步也在锁里，也在停止阶段的预算里。它自己那个 2s 超时是
+                # 独立的，所以一次卡住的 main_server 能让关停在预算之外再多花
+                # 两秒，而锁一直握着（codex）。按剩余预算收窄。
+                #
+                # 但**不能**用 _clamp_step_timeout：那个下界是给"启动"用的，因为
+                # 一个被我们停掉的插件必须拿到一次真正的尝试。这里是尽力而为的
+                # 远端清理，预算见底还硬给它 1s，就是每个插件都在锁上多压一秒
+                # （CodeRabbit）。
+                #
+                # 也**不能**在预算见底时干脆跳过——我上一版就是那么写的，是错的。
+                # 全仓只有这一处清理远端工具注册，没有任何对账或重试兜底：跳过之后
+                # host 已经摘掉，而 main_server 那边的工具还在向模型公布，模型选中
+                # 它只会拿到"插件没在跑"，并且永远不会自愈（Greptile）。
+                #
+                # 所以给一个很小的下界，让它至少发得出去。这比跳过**严格更好**：
+                # 失败了也不过回到跳过的状态（这个 POST 是按 source 整体清除、幂等，
+                # 重发无害），成功了就少一批幽灵工具。而正常情况下这是一次本机
+                # POST、毫秒级返回，下界根本不会生效。
+                cleanup_budget = _remaining_step_budget(stop_deadline)
+                cleanup_result = await clear_plugin_llm_tools(
+                    plugin_id,
+                    timeout=(
+                        None
+                        if cleanup_budget is None
+                        else min(
+                            _CLEAR_TOOLS_BUDGET_SECONDS,
+                            max(_MIN_TOOL_CLEANUP_TIMEOUT, cleanup_budget),
+                        )
+                    ),
+                )
+                if isinstance(cleanup_result, dict) and not cleanup_result.get("ok"):
+                    # 提到 warning。清理本身是尽力而为，但"没清掉"的后果是模型看得见
+                    # 一个调不通的工具、而没有任何东西会重试；debug 级别等于没留痕。
+                    logger.warning(
+                        "plugin stopped but its LLM tools may still be advertised: "
+                        "plugin_id={}, reason={}",
+                        plugin_id,
+                        cleanup_result.get("error") or cleanup_result.get("status_code"),
+                    )
             except Exception as exc:
-                logger.debug(
-                    "clear_plugin_llm_tools failed (best-effort): plugin_id={}, err_type={}, err={}",
+                # 和上面 ok=False 那条同一句话、同一个级别：两条路的后果一模一样
+                # ——工具可能还挂在 main_server 上，而没有任何东西会重试。
+                #
+                # 抛出这条尤其隐蔽：clear_plugin_tools 内部只挡 httpx.HTTPError 和
+                # asyncio.TimeoutError，一个 content-type 声明是 JSON、正文却坏掉的
+                # 响应会让 resp.json() 抛 ValueError 一路冒到这里（CodeRabbit）。留在
+                # debug 的话，这条路上的幽灵工具照样无从追查。
+                logger.warning(
+                    "plugin stopped but its LLM tools may still be advertised: "
+                    "plugin_id={}, err_type={}, err={}",
                     plugin_id,
                     type(exc).__name__,
                     str(exc),
@@ -1147,8 +1313,57 @@ class PluginLifecycleService:
                 "message": "No running plugins to reload",
             }
 
-        stop_tasks = [self._safe_stop_for_reload(plugin_id) for plugin_id in running_plugin_ids]
-        stop_outcomes = await asyncio.gather(*stop_tasks)
+        # 顺序，不是 gather。
+        #
+        # 这里原本是 asyncio.gather，但它一点并发都买不到：每个
+        # _safe_stop_for_reload 内层的 stop_plugin 自己带
+        # @serialized_plugin_operation，而那把锁的重入是按 asyncio.Task 认的
+        # （_OPERATION_OWNER 存的是任务对象）。gather 给每个协程新建一个 Task，
+        # 子任务的 current_task 必然不等于持锁那个，于是重入判定失败，N 个 stop
+        # 严格排队。这个"按任务认"是刻意的——它防的正是无关任务蹭别人的锁——
+        # 所以不能靠改重入来让它真并行。
+        #
+        # 写成顺序循环是为了让代码说实话：它本来就是顺序的。同时顺带能在中途
+        # 检查预算，gather 做不到这件事。
+        stop_outcomes = []
+        skipped_over_budget: list[str] = []
+        stop_deadline = time_module.monotonic() + _RELOAD_ALL_BUDGET_SECONDS
+        for index, plugin_id in enumerate(running_plugin_ids):
+            if time_module.monotonic() > stop_deadline:
+                # 剩下的记进 skipped 再返回，不能让它们既不在成功里也不在失败里
+                # ——那样调用方看到的是一份"少了几个插件"的结果，而没有任何东西
+                # 说它们为什么不见了。
+                skipped_over_budget = list(running_plugin_ids[index:])
+                logger.warning(
+                    "reload_all stop phase over budget after {}s, {} plugin(s) skipped",
+                    _RELOAD_ALL_BUDGET_SECONDS,
+                    len(skipped_over_budget),
+                )
+                break
+            # 这一次 stop 也要受剩余预算约束：只在开始前检查的话，一个慢关停
+            # （或者调大了的 NEKO_PLUGIN_SHUTDOWN_TIMEOUT）就能让整个阶段冲破
+            # 对外承诺的墙钟上限（codex）。
+            #
+            # 但不能用 asyncio.wait_for 包在外面。stop_plugin 带
+            # @serialized_plugin_operation，而那个包装器一旦拿到锁就屏蔽取消、
+            # 等内层跑完再抛 CancelledError（operation_lock 里的 shield 循环）。
+            # 于是请求照样阻塞整个关停时长，然后把一次**已经成功**的停止报成超时，
+            # 插件被排除在重启名单外，最后停着没起来（codex）。
+            #
+            # 把预算送进去，而不是套在外面：等锁那段由 bounded_operation_wait
+            # 管，真正关停那段由 shutdown_timeout 管，两段都在预算内结束，返回的
+            # 也是真实结果。
+            # 等锁和关停各自按"此刻还剩多少"算，不能共用一个快照。共用的话，一次
+            # 等满 remaining 的抢锁之后，关停又拿到一份完整的 remaining，一轮就能
+            # 花掉两倍预算——这跟两层锁各起一份截止期是同一个错误，只是换了个地方
+            # （本轮对抗复审）。
+            remaining = max(0.0, stop_deadline - time_module.monotonic())
+            with bounded_operation_wait(remaining):
+                stop_outcomes.append(
+                    await self._safe_stop_for_reload(
+                        plugin_id, stop_deadline=stop_deadline
+                    )
+                )
 
         plugins_to_start: list[str] = []
         failed: list[dict[str, object]] = []
@@ -1158,10 +1373,59 @@ class PluginLifecycleService:
                 continue
             failed.append({"plugin_id": outcome.plugin_id, "error": outcome.error or "Stop failed"})
 
+        # 也进 skipped：既有契约里 skipped 是"没被尝试"的意思，而这些插件正是
+        # 没被尝试。只放进 failed 会让调用方分不清"停失败了"和"根本没轮到"。
+        for plugin_id in skipped_over_budget:
+            failed.append(
+                {
+                    "plugin_id": plugin_id,
+                    "error": (
+                        "skipped: reload exceeded its "
+                        f"{_RELOAD_ALL_BUDGET_SECONDS:g}s budget"
+                    ),
+                }
+            )
+
         reloaded: list[str] = []
         ordered_plugin_ids = await plugin_registry_service.order_plugin_ids(plugins_to_start)
+        # 启动阶段有**自己**的预算，不吃停止阶段剩下的。
+        #
+        # 启动阶段确实也需要上限：start_plugin 通常比 stop 慢得多（读配置、拉子
+        # 进程、扫元数据），只管住停止阶段的话整轮 reload 照样能冲破前端的 30s
+        # （CodeRabbit）。但两个阶段不能共用一份预算：走到这里的插件都是**已经被
+        # 我们停掉**的，停一个插件就欠它一次启动。共用预算时，一个慢关停就能把
+        # 剩下的额度吃光，于是 reload 悄悄变成 stop——插件全下线了，而调用方看到
+        # 的只是一行 "over budget"。宁可整轮多花一份预算，也不能把用户的插件留在
+        # 停止状态。
+        #
+        # 而且这个循环**不会**因为预算耗尽而中途退出——这一点和停止阶段刻意不对称。
+        # 停止阶段跳过一个插件是安全的：没轮到的插件还好好跑着。启动阶段跳过一个
+        # 插件，等于把一个我们刚亲手停掉的插件永久留在停止状态：自启动只在服务器
+        # 启动时跑一次，没有任何周期性对账会把它捡回来，用户只能手动启动或者重启
+        # 整个服务器（Greptile）。所以每个被停掉的插件都必须拿到一次启动尝试；
+        # 预算见底之后它们各自拿下界那么长，够不够是另一回事，但"根本没试"不行。
+        #
+        # 代价说清楚：启动阶段的墙钟上限因此是 预算 + 剩余插件数 x 下界，而不是
+        # 一个硬预算。健康路径根本碰不到——实测启动很快，预算压根用不完。
+        start_deadline = time_module.monotonic() + _RELOAD_ALL_BUDGET_SECONDS
         for plugin_id in ordered_plugin_ids:
-            outcome = await self._safe_start_for_reload(plugin_id)
+            # 启动这半边同样把等锁和启动本身都封在剩余预算里——和上面的 stop
+            # 对称，否则预算只管住了两个阶段中的一个。
+            #
+            # 但等锁那段和步骤超时用同一个下界，不能压到 0：预算见底时
+            # bounded_operation_wait(0.0) 等于"一次都不等"，此刻只要有别的插件操作
+            # 握着进程锁，start_plugin 立刻抛 PluginOperationBusy，而这个插件是刚被
+            # 我们停掉的——它会就这么一直停着（CodeRabbit）。刚去掉超预算 break 就是
+            # 为了不让这种事发生，零等待等于把它从后门放回来。
+            #
+            # 停止侧不需要这个下界，而且那是刻意的：停止侧等不到锁，插件还好好跑着。
+            remaining = max(
+                _MIN_CLAMPED_STEP_TIMEOUT, start_deadline - time_module.monotonic()
+            )
+            with bounded_operation_wait(remaining):
+                outcome = await self._safe_start_for_reload(
+                    plugin_id, start_deadline=start_deadline
+                )
             if outcome.success:
                 reloaded.append(outcome.plugin_id)
                 continue
@@ -1188,7 +1452,7 @@ class PluginLifecycleService:
             "success": success,
             "reloaded": reloaded,
             "failed": failed,
-            "skipped": [],
+            "skipped": list(skipped_over_budget),
             "message": message,
         }
 
@@ -1253,18 +1517,30 @@ class PluginLifecycleService:
         await asyncio.to_thread(retry_deferred_plugin_code_cleanup_sync)
         return cleaned_profiles
 
-    async def _safe_stop_for_reload(self, plugin_id: str) -> _ReloadOutcome:
+    async def _safe_stop_for_reload(
+        self, plugin_id: str, *, stop_deadline: float | None = None
+    ) -> _ReloadOutcome:
         try:
-            await self.stop_plugin(plugin_id)
+            await self.stop_plugin(plugin_id, stop_deadline=stop_deadline)
             return _ReloadOutcome(plugin_id=plugin_id, success=True)
+        except PluginOperationBusy as error:
+            return _ReloadOutcome(plugin_id=plugin_id, success=False, error=str(error))
         except ServerDomainError as error:
             if error.status_code == 404:
                 return _ReloadOutcome(plugin_id=plugin_id, success=True)
             return _ReloadOutcome(plugin_id=plugin_id, success=False, error=error.message)
 
-    async def _safe_start_for_reload(self, plugin_id: str) -> _ReloadOutcome:
+    async def _safe_start_for_reload(
+        self, plugin_id: str, *, start_deadline: float | None = None
+    ) -> _ReloadOutcome:
         try:
-            await self.start_plugin(plugin_id, refresh_registry=False)
+            await self.start_plugin(
+                plugin_id,
+                refresh_registry=False,
+                start_deadline=start_deadline,
+            )
             return _ReloadOutcome(plugin_id=plugin_id, success=True)
+        except PluginOperationBusy as error:
+            return _ReloadOutcome(plugin_id=plugin_id, success=False, error=str(error))
         except ServerDomainError as error:
             return _ReloadOutcome(plugin_id=plugin_id, success=False, error=error.message)
