@@ -828,12 +828,27 @@ def test_compact_history_size_tokens_are_ratio_based_for_ui_optimization():
         ".compact-export-preview-message.is-system .compact-export-preview-bubble {",
         ".compact-export-preview-meta",
     )
+    link_anchor_block = css_block(
+        styles,
+        ".compact-export-history-anchor:has(.compact-export-history-content > .message-block-link) {",
+        ".compact-export-history-bubble:has(> .compact-export-history-content > .message-block-link)",
+    )
+    active_inline_size_marker = "--compact-export-history-active-inline-size:"
+    assert active_inline_size_marker in link_anchor_block
+    active_inline_size = link_anchor_block.split(active_inline_size_marker, 1)[1].split(";", 1)[0]
 
     assert "--compact-export-history-width-ratio:" in anchor_block
     assert "--compact-export-surface-width: var(--compact-surface-resize-width, var(--desktop-compact-surface-width, var(--compact-surface-width, 430px)));" in anchor_block
     assert "--compact-export-history-inline-size: min(" in anchor_block
     assert "calc(var(--compact-export-surface-width) * var(--compact-export-history-width-ratio))" in anchor_block
-    assert "width: var(--compact-export-history-inline-size);" in anchor_block
+    assert "--compact-export-history-active-inline-size: var(--compact-export-history-inline-size);" in anchor_block
+    assert "width: var(--compact-export-history-active-inline-size);" in anchor_block
+    assert "min(" in active_inline_size
+    assert (
+        "max(var(--compact-export-history-inline-size), var(--compact-export-link-history-min-inline-size))"
+        in active_inline_size
+    )
+    assert "var(--compact-export-history-max-inline-size)" in active_inline_size
     assert "--compact-export-history-max-inline-size: calc(100vw - var(--compact-export-history-viewport-gutter));" in anchor_block
     assert "--compact-export-preview-min-height: 360px;" in anchor_block
     assert "--compact-export-preview-max-height: 78vh;" in anchor_block
