@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -35,7 +36,9 @@ def galgame_plugin_dir() -> Path:
 def registered_install_plugins(
     monkeypatch: pytest.MonkeyPatch,
     galgame_plugin_dir: Path,
-) -> None:
+) -> Iterator[None]:
+    with state.acquire_plugins_read_lock():
+        plugins_backup = copy.deepcopy(state.plugins)
     monkeypatch.setattr(install_registry_module, "_install_plugin_registry", {})
     galgame_install_route_module.register_install_plugin(
         "galgame_plugin",
@@ -66,6 +69,35 @@ def registered_install_plugins(
         ui_i18n_dir=galgame_plugin_dir.parent / "study_companion" / "i18n",
         tutorial_enabled=True,
     )
+    with state.acquire_plugins_write_lock():
+        state.plugins.clear()
+        state.plugins.update(
+            {
+                "galgame_plugin": {
+                    "id": "galgame_plugin",
+                    "config_path": str(galgame_plugin_dir / "plugin.toml"),
+                    "entries_preview": [
+                        {"id": "galgame_install_textractor"},
+                        {"id": "galgame_download_rapidocr_models"},
+                    ],
+                    "effective_source": "builtin",
+                },
+                "study_companion": {
+                    "id": "study_companion",
+                    "config_path": str(galgame_plugin_dir.parent / "study_companion" / "plugin.toml"),
+                    "entries_preview": [
+                        {"id": "study_download_rapidocr_models"},
+                    ],
+                    "effective_source": "builtin",
+                },
+            }
+        )
+    try:
+        yield
+    finally:
+        with state.acquire_plugins_write_lock():
+            state.plugins.clear()
+            state.plugins.update(plugins_backup)
 
 
 @pytest.fixture
@@ -118,8 +150,8 @@ def registered_galgame_plugin_meta(galgame_plugin_dir: Path) -> Iterator[None]:
     plugins_backup = copy.deepcopy(state.plugins)
     try:
         with state.acquire_plugins_write_lock():
-            state.plugins.clear()
-            state.plugins["galgame_plugin"] = {
+            galgame_meta = dict(state.plugins.get("galgame_plugin") or {})
+            galgame_meta.update({
                 "id": "galgame_plugin",
                 "name": "Galgame Plugin",
                 "config_path": str(galgame_plugin_dir / "plugin.toml"),
@@ -138,7 +170,8 @@ def registered_galgame_plugin_meta(galgame_plugin_dir: Path) -> Iterator[None]:
                         "open_in": "new_tab",
                     }
                 ],
-            }
+            })
+            state.plugins["galgame_plugin"] = galgame_meta
         yield
     finally:
         with state.acquire_plugins_write_lock():
@@ -345,6 +378,201 @@ async def test_galgame_plugin_ui_i18n_api_serves_locale_bundle(
 
 
 @pytest.mark.asyncio
+async def test_plugin_ui_i18n_rejects_locale_file_symlink_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    config_path = plugin_root / "plugin.toml"
+    config_path.write_text('[plugin]\nid = "external_plugin"\n', encoding="utf-8")
+    i18n_dir = plugin_root / "i18n"
+    i18n_dir.mkdir()
+    outside_file = tmp_path / "outside.json"
+    outside_file.write_text('{"secret": true}', encoding="utf-8")
+    locale_file = i18n_dir / "en.json"
+    try:
+        locale_file.symlink_to(outside_file)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    registration = galgame_install_route_module.InstallPluginRegistration(
+        plugin_id="external_plugin",
+        install_kinds={},
+        ui_i18n_dir=i18n_dir,
+        config_path=config_path,
+    )
+
+    async def registration_for(_plugin_id: str):
+        return registration
+
+    monkeypatch.setattr(
+        galgame_install_route_module,
+        "_get_plugin_registration",
+        registration_for,
+    )
+
+    response = await galgame_install_route_module.get_plugin_ui_i18n(
+        "external_plugin",
+        "en",
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_plugin_ui_i18n_pins_payload_before_locale_path_is_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    config_path = plugin_root / "plugin.toml"
+    config_path.write_text('[plugin]\nid = "external_plugin"\n', encoding="utf-8")
+    i18n_dir = plugin_root / "i18n"
+    i18n_dir.mkdir()
+    locale_file = i18n_dir / "en.json"
+    locale_file.write_text('{"safe": true}', encoding="utf-8")
+    outside_file = tmp_path / "outside.json"
+    outside_file.write_text('{"secret": true}', encoding="utf-8")
+
+    registration = galgame_install_route_module.InstallPluginRegistration(
+        plugin_id="external_plugin",
+        install_kinds={},
+        ui_i18n_dir=i18n_dir,
+        config_path=config_path,
+    )
+
+    async def registration_for(_plugin_id: str):
+        return registration
+
+    original_run_blocking = galgame_install_route_module._run_blocking
+
+    async def swap_after_blocking_read(func, *args, **kwargs):
+        result = await original_run_blocking(func, *args, **kwargs)
+        locale_file.unlink()
+        outside_file.replace(locale_file)
+        return result
+
+    monkeypatch.setattr(
+        galgame_install_route_module,
+        "_get_plugin_registration",
+        registration_for,
+    )
+    monkeypatch.setattr(
+        galgame_install_route_module,
+        "_run_blocking",
+        swap_after_blocking_read,
+    )
+
+    response = await galgame_install_route_module.get_plugin_ui_i18n(
+        "external_plugin",
+        "en",
+    )
+
+    assert response.status_code == 200
+    assert response.body == b'{"safe": true}'
+    assert b"secret" not in response.body
+
+
+@pytest.mark.asyncio
+async def test_plugin_ui_i18n_rejects_replaced_base_directory_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    config_path = plugin_root / "plugin.toml"
+    config_path.write_text('[plugin]\nid = "external_plugin"\n', encoding="utf-8")
+    i18n_dir = plugin_root / "i18n"
+    i18n_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "en.json").write_text('{"secret": true}', encoding="utf-8")
+    i18n_dir.rmdir()
+    try:
+        i18n_dir.symlink_to(outside_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+
+    registration = galgame_install_route_module.InstallPluginRegistration(
+        plugin_id="external_plugin",
+        install_kinds={},
+        ui_i18n_dir=i18n_dir,
+        config_path=config_path,
+    )
+
+    async def registration_for(_plugin_id: str):
+        return registration
+
+    monkeypatch.setattr(
+        galgame_install_route_module,
+        "_get_plugin_registration",
+        registration_for,
+    )
+
+    response = await galgame_install_route_module.get_plugin_ui_i18n(
+        "external_plugin",
+        "en",
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_plugin_ui_i18n_opens_fifo_nonblocking_before_rejecting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(os, "mkfifo") or not getattr(os, "O_NONBLOCK", 0):
+        pytest.skip("FIFO nonblocking behavior requires POSIX")
+
+    plugin_root = tmp_path / "plugin"
+    plugin_root.mkdir()
+    config_path = plugin_root / "plugin.toml"
+    config_path.write_text('[plugin]\nid = "external_plugin"\n', encoding="utf-8")
+    i18n_dir = plugin_root / "i18n"
+    i18n_dir.mkdir()
+    fifo_path = i18n_dir / "en.json"
+    os.mkfifo(fifo_path)
+
+    registration = galgame_install_route_module.InstallPluginRegistration(
+        plugin_id="external_plugin",
+        install_kinds={},
+        ui_i18n_dir=i18n_dir,
+        config_path=config_path,
+    )
+
+    async def registration_for(_plugin_id: str):
+        return registration
+
+    original_open = os.open
+    opened_nonblocking = False
+
+    def guarded_open(path, flags, *args, **kwargs):
+        nonlocal opened_nonblocking
+        opened_nonblocking = bool(flags & os.O_NONBLOCK)
+        if not opened_nonblocking:
+            raise AssertionError("locale files must be opened nonblocking")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(
+        galgame_install_route_module,
+        "_get_plugin_registration",
+        registration_for,
+    )
+    monkeypatch.setattr(galgame_install_route_module.os, "open", guarded_open)
+
+    response = await galgame_install_route_module.get_plugin_ui_i18n(
+        "external_plugin",
+        "en",
+    )
+
+    assert opened_nonblocking is True
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_unregistered_plugin_install_route_returns_404(
     plugin_ui_async_client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -360,9 +588,10 @@ async def test_unregistered_plugin_install_route_returns_404(
     assert response.json()["detail"] == "Plugin 'unknown_plugin' has no install API"
 
 
-def test_invalid_plugin_id_404_does_not_reflect_raw_input() -> None:
+@pytest.mark.asyncio
+async def test_invalid_plugin_id_404_does_not_reflect_raw_input() -> None:
     with pytest.raises(HTTPException) as exc_info:
-        galgame_install_route_module._get_plugin_registration("../secret")
+        await galgame_install_route_module._get_plugin_registration("../secret")
 
     assert exc_info.value.status_code == 404
     assert exc_info.value.detail == "Plugin has no install API"
@@ -466,7 +695,6 @@ async def test_install_start_returns_retryable_state_when_local_persist_raises_v
         return RunCreateResponse(run_id="run-local-state-value-error", status="queued")
 
     async def _fake_run_blocking(func, *args, **kwargs):
-        del args, kwargs
         if getattr(func, "__name__", "") == "update_install_task_state":
             raise ValueError("invalid local state")
         return func(*args, **kwargs)
@@ -792,7 +1020,21 @@ async def test_galgame_plugin_textractor_install_stream_route_emits_sse_payload(
     plugin_ui_async_client: AsyncClient,
     registered_galgame_plugin_meta,
     galgame_install_runtime_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    original_get_registration = install_registry_module.get_install_plugin_registration
+    registration_reads = 0
+
+    def counted_get_registration(plugin_id: str):
+        nonlocal registration_reads
+        registration_reads += 1
+        return original_get_registration(plugin_id)
+
+    monkeypatch.setattr(
+        install_registry_module,
+        "get_install_plugin_registration",
+        counted_get_registration,
+    )
     install_task_module.update_install_task_state(
         "run-textractor-stream",
         plugin_id="galgame_plugin",
@@ -817,6 +1059,7 @@ async def test_galgame_plugin_textractor_install_stream_route_emits_sse_payload(
     payload = json.loads(body)
     assert payload["task_id"] == "run-textractor-stream"
     assert payload["status"] == "completed"
+    assert registration_reads == 1
 
 
 @pytest.mark.asyncio
