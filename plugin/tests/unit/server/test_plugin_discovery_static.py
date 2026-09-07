@@ -1565,3 +1565,140 @@ def test_a_v3_package_is_refused_and_takes_the_worker_path(tmp_path, monkeypatch
     )
     assert [(entry["id"], entry["name"]) for entry in listed] == [("go", "Declared")]
     assert meta_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("shape, expected", [
+    ("missing", None),
+    ("current", None),
+    ("v3", 3),
+    ("v2", 2),
+    ("newer", None),
+    ("string_version", None),
+    ("bool_version", None),
+    ("not_json", None),
+    ("not_object", None),
+    ("oversized", None),
+])
+def test_only_a_real_outdated_file_counts_as_stale(tmp_path, shape, expected):
+    """Stale means "an upgrade would fix it", nothing looser.
+
+    A missing or broken file has nothing to upgrade; a current-schema file was
+    refused for a reason a rewrite cannot fix; a version that is not an int is
+    a malformed file, not an old one; a newer version came from a newer host
+    and rewriting it would be a downgrade (greptile).
+    """
+    plugin_dir = _write_plugin(tmp_path, entries=[{"id": "go"}])
+    meta_path = plugin_dir / packaged_metadata.PACKAGED_METADATA_FILENAME
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    if shape == "missing":
+        meta_path.unlink()
+    elif shape == "v3":
+        raw["schema_version"] = 3
+    elif shape == "v2":
+        raw["schema_version"] = 2
+    elif shape == "newer":
+        raw["schema_version"] = packaged_metadata.PACKAGED_METADATA_SCHEMA_VERSION + 1
+    elif shape == "string_version":
+        raw["schema_version"] = "3"
+    elif shape == "bool_version":
+        raw["schema_version"] = True
+    elif shape == "not_json":
+        meta_path.write_text("{not json", encoding="utf-8")
+    elif shape == "not_object":
+        meta_path.write_text("[3]", encoding="utf-8")
+    elif shape == "oversized":
+        raw["schema_version"] = 3
+        raw["padding"] = "x" * (packaged_metadata.MAX_PACKAGED_METADATA_BYTES + 1)
+    if shape not in ("missing", "not_json", "not_object"):
+        meta_path.write_text(json.dumps(raw), encoding="utf-8")
+    assert packaged_metadata.stale_packaged_schema_version(plugin_dir) == expected
+
+
+def test_an_upgraded_file_is_what_the_packager_would_have_written(tmp_path):
+    """Same keys, same fingerprint, accepted by the same reader."""
+    from plugin.neko_plugin_cli.core import metadata_probe
+
+    plugin_dir = _write_plugin(tmp_path, entries=[{"id": "go"}])
+    meta_path = plugin_dir / packaged_metadata.PACKAGED_METADATA_FILENAME
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw["schema_version"] = 3
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+    handler = {"event_type": "plugin_entry", "id": "go", "name": "Go", "timeout": 4}
+
+    before_scan = packaged_metadata.snapshot_source_tree(plugin_dir)
+    assert packaged_metadata.refresh_stale_packaged_metadata(
+        plugin_dir,
+        before_scan=before_scan,
+        entries=[{"id": "go", "name": "Go"}],
+        handlers={"demo.go": handler},
+        entry_methods={"go": "go"},
+        conf={}, pdata={},
+    ) is True
+    written_bytes = meta_path.read_bytes()
+    # 落盘的字节就是量过的字节：不能经文本模式在 Windows 上被展开成 CRLF（codex）。
+    assert b"\r" not in written_bytes
+    written = json.loads(written_bytes.decode("utf-8"))
+    # 键集合和打包器 derive_plugin_metadata 返回的字典一致：多一个少一个都算格式漂移。
+    import ast as _ast
+    import inspect as _inspect
+
+    tree = _ast.parse(_inspect.getsource(metadata_probe.derive_plugin_metadata))
+    packager_keys = {
+        key.value
+        for node in _ast.walk(tree)
+        if isinstance(node, _ast.Return) and isinstance(node.value, _ast.Dict)
+        for key in node.value.keys
+        if isinstance(key, _ast.Constant)
+    }
+    assert packager_keys, "没找到打包器的返回字典，测试自身失效"
+    assert set(written) == packager_keys
+    assert written["source_sha256"] == packaged_metadata.compute_source_sha256(plugin_dir)
+    assert written["handlers"]["demo.go"] == handler
+    packaged = packaged_metadata.read_packaged_metadata(plugin_dir)
+    assert packaged is not None
+    assert packaged.handlers["demo.go"]["timeout"] == 4
+    # 指纹阶段出错（文件在枚举和哈希之间消失）不能变成启动失败：只记日志、不写。
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw["schema_version"] = 3
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+    before = meta_path.read_bytes()
+
+    def _vanished(_plugin_dir):
+        raise packaged_metadata.PackagedMetadataError("source file vanished mid-hash")
+
+    original = packaged_metadata.compute_source_sha256
+    packaged_metadata.compute_source_sha256 = _vanished
+    try:
+        assert packaged_metadata.refresh_stale_packaged_metadata(
+            plugin_dir, before_scan=before_scan,
+            entries=[], handlers={}, entry_methods={}, conf={}, pdata={},
+        ) is False
+    finally:
+        packaged_metadata.compute_source_sha256 = original
+    assert meta_path.read_bytes() == before
+
+    # 写出来的文件读取器读不了（超过尺寸上限）就不写：它会是"当前版本且超大"，
+    # 之后没有任何路径能再修它。上限设成正好等于输入文件的大小：输入能过
+    # stale 判据，带缩进、多了指纹字段的输出一定超（coderabbit）。
+    original_cap = packaged_metadata.MAX_PACKAGED_METADATA_BYTES
+    packaged_metadata.MAX_PACKAGED_METADATA_BYTES = len(before)
+    assert packaged_metadata.stale_packaged_schema_version(plugin_dir) == 3
+    try:
+        assert packaged_metadata.refresh_stale_packaged_metadata(
+            plugin_dir, before_scan=before_scan,
+            entries=[{"id": "go", "name": "Go"}], handlers={"demo.go": handler},
+            entry_methods={"go": "go"}, conf={}, pdata={},
+        ) is False
+    finally:
+        packaged_metadata.MAX_PACKAGED_METADATA_BYTES = original_cap
+    assert meta_path.read_bytes() == before
+    raw["schema_version"] = packaged_metadata.PACKAGED_METADATA_SCHEMA_VERSION
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    # 第二次没有过期文件可升，什么都不写。
+    before = meta_path.read_bytes()
+    assert packaged_metadata.refresh_stale_packaged_metadata(
+        plugin_dir, before_scan=before_scan,
+        entries=[], handlers={}, entry_methods={}, conf={}, pdata={},
+    ) is False
+    assert meta_path.read_bytes() == before
