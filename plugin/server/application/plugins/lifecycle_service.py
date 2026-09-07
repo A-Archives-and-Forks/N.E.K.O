@@ -24,6 +24,8 @@ from plugin.core.registry import (
     _collect_plugin_python_requirement_paths,
     _check_plugin_dependency,
     _find_missing_python_requirements,
+    _effective_entries,
+    _overlay_entry_declaration,
     _parse_plugin_dependencies,
     _resolve_plugin_id_conflict,
 )
@@ -59,7 +61,9 @@ from plugin.server.application.plugins.metadata_scanner import (
     install_isolated_plugin_metadata,
     scan_plugin_metadata_isolated,
 )
-from plugin.server.infrastructure.packaged_metadata import read_packaged_metadata
+from plugin.server.infrastructure.packaged_metadata import (
+    read_packaged_metadata,
+)
 from plugin.server.application.install_source import (
     InstallSourceError,
     get_install_source_manager,
@@ -157,12 +161,14 @@ def _read_packaged_isolated_metadata(
     worker in that case, since it mints keys under the id we pass it.
 
     An empty ``handlers`` mapping is an answer, not a gap: a background-only
-    plugin registers no entries, and schema v3 always writes the key. Treating
-    empty as "no metadata" sent exactly those plugins back through the worker —
+    plugin registers no entries, and the current schema always writes the key.
+    Treating empty as "no metadata" sent exactly those plugins back through the worker —
     one import for the scan, one for the host, so any module-level side effect
     (writing state, sending a notification, launching a helper) happened twice
-    (codex). There is no older package to protect: the version gate above only
-    accepts v3, and v1/v2 were never released.
+    (codex). An artifact written under an older schema is refused by the reader
+    and takes the worker path: one import per start until the plugin is
+    repackaged, which is what every plugin paid before packaged metadata
+    existed. Schema 3 never shipped in a release, so no in-memory migration.
 
     Returns ``None`` when there is no usable metadata at all.
     """
@@ -197,7 +203,11 @@ def _read_packaged_isolated_metadata(
         )
         return None
     return IsolatedPluginMetadata(
-        entries_preview=list(packaged.entries),
+        entries_preview=_overlay_entry_declaration(
+            packaged.entries,
+            dict(conf) if isinstance(conf, Mapping) else {},
+            dict(pdata) if isinstance(pdata, Mapping) else {},
+        ),
         handlers=dict(packaged.handlers),
         entry_methods=dict(packaged.entry_methods),
     )

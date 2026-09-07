@@ -27,6 +27,12 @@ from plugin.server.application.plugins import registry_service as module
 from plugin.server.infrastructure import autostart_approvals, packaged_metadata
 from plugin.settings import BUILTIN_PLUGIN_CONFIG_ROOT
 
+# `platform` 第一次问操作系统版本时会 shell 出一个 `ver`，答案之后缓存在它自己的
+# 模块全局里。跑整个文件时这一下发生在某条更早的用例里，`_no_subprocess` 看不到；
+# 单跑任意一条用它的用例时却落进毒化窗口，报成"discovery 起了子进程"。在这里先问
+# 一次，让这些用例单跑和全量跑是同一个结果。
+packaged_metadata.build_environment()
+
 pytestmark = pytest.mark.plugin_unit
 
 
@@ -153,7 +159,7 @@ def _write_plugin(tmp_path: Path, *, entries: list[dict], sdk_version: str | Non
             else packaged_metadata.build_environment()
         ),
         "entries": entries,
-        # v3 一定会写这三张表，缺哪张都算包坏了。
+        # 当前 schema 一定会写这三张表，缺哪张都算包坏了。
         "handlers": {},
         "entry_methods": {},
         "entries_config_sha256": packaged_metadata.entries_config_digest({}, {}),
@@ -1519,3 +1525,43 @@ def test_an_empty_directory_is_reported_before_packaging(tmp_path: Path) -> None
     assert reported == ["runtime", "runtime/logs"], (
         f"空目录没被完整报出来（装不到用户机器上的正是它们）：{reported}"
     )
+
+
+def test_a_v3_package_is_refused_and_takes_the_worker_path(tmp_path, monkeypatch):
+    """Schema 3 handlers are truncated; the file is stale, not repairable.
+
+    v3 serialized slotted SDK metadata through a ten-field fallback, so its
+    handler table has no timeout / result fields and configured entries carry a
+    blank input_schema. Patching that up in memory needs another hand-kept list
+    of "what the host reads" and still leaves the display fields wrong. Schema
+    3 only ever existed on nightly, so it is refused like schema 2: no import,
+    no rewrite, and the start path scans once until the plugin is repackaged.
+    """
+    from types import SimpleNamespace
+
+    from plugin.server.application.plugins import lifecycle_service, metadata_scanner
+
+    plugin_dir = _write_plugin(tmp_path, entries=[{"id": "go", "timeout": 100}])
+    meta_path = plugin_dir / packaged_metadata.PACKAGED_METADATA_FILENAME
+    raw = json.loads(meta_path.read_text())
+    raw["schema_version"] = 3
+    raw["handlers"] = {"demo.go": {"event_type": "plugin_entry", "id": "go", "name": "Go"}}
+    raw["entry_methods"] = {"go": "go"}
+    meta_path.write_text(json.dumps(raw))
+    before = meta_path.read_bytes()
+
+    def cannot_import(*args, **kwargs):
+        raise AssertionError("metadata reads must not import plugins")
+
+    monkeypatch.setattr(metadata_scanner, "scan_plugin_metadata_isolated", cannot_import)
+    assert packaged_metadata.read_packaged_metadata(plugin_dir) is None
+    assert lifecycle_service._read_packaged_isolated_metadata(
+        plugin_dir / "plugin.toml", "demo",
+    ) is None
+    # 发现侧照旧走 manifest 声明的那条通路，不会因为包过期就没有入口可列。
+    conf = {"entries": [{"id": "go", "name": "Declared"}]}
+    listed = module._packaged_entries_preview(
+        SimpleNamespace(toml_path=plugin_dir / "plugin.toml", conf=conf, pdata={}), "demo",
+    )
+    assert [(entry["id"], entry["name"]) for entry in listed] == [("go", "Declared")]
+    assert meta_path.read_bytes() == before
