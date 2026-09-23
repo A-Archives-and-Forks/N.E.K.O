@@ -45,6 +45,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / "static" / "i18n-i18next.js"
 LOCALES_DIR = ROOT / "static" / "locales"
@@ -63,6 +65,8 @@ LOCALE_VERSION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9._-]*$")
 # 递增 LOCALE_VERSION 时，把旧值追加到这里。
 RETIRED_LOCALE_VERSIONS = frozenset(
     {
+        "2026-09-11-voice-session-activation-main",
+        "2026-09-14-plugin-model-api-proactive-community",
         "2026-09-12-watch-together-image-generation",
         "2026-09-13-plugin-model-api-watch-together",
         "2026-09-14-proactive-community-chat",
@@ -150,6 +154,9 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-11-watch-together",
         "2026-09-11-watch-together-discovery",
         "2026-09-06-plugin-model-api",
+        "2026-09-09-voice-session-activation-pngtuber",
+        "2026-09-03-voice-identity-five-second-verification",
+        "2026-09-08-voice-session-activation",
     }
 )
 
@@ -162,7 +169,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
 #
 # 数组也按下标展开，所以往 badminton.lines.* 这类台词数组里追加一条同样会打红：
 # 陈旧缓存下那一条会取到 undefined，症状和缺 key 是一类。
-LOCALE_KEY_SIGNATURE = "591e5b1a9eac60d3626279550db11ea421f9b7e243a9da0ae00cf5e7a1d84c8d"
+LOCALE_KEY_SIGNATURE = "d6d2d11b87568b90e35fec096045859b660991d99d023cfd98351a4aff9bb113"
 
 _BUMP_INSTRUCTIONS = (
     "static/locales 的 key 结构变了。请在 static/i18n-i18next.js 里把 LOCALE_VERSION "
@@ -276,3 +283,5 @@ def test_bump_instructions_name_every_step_of_the_fix() -> None:
     assert "LOCALE_VERSION" in _BUMP_INSTRUCTIONS
     assert "RETIRED_LOCALE_VERSIONS" in _BUMP_INSTRUCTIONS
     assert "LOCALE_KEY_SIGNATURE" in _BUMP_INSTRUCTIONS
+
+pytestmark = pytest.mark.frontend_contract
