@@ -145,6 +145,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-01-vllm-omni-clone-preflight",
         "2026-09-02-vllm-omni-clone-preflight",
         "2026-09-02-vllm-omni-clone-tts-state",
+        "2026-09-07-plugin-html-content",
         "2026-09-08-drawing-guess",
         "2026-09-09-pngtuber-import-status",
         "2026-09-10-drawing-guess-pngtuber-import-status",
@@ -154,9 +155,15 @@ RETIRED_LOCALE_VERSIONS = frozenset(
         "2026-09-11-watch-together",
         "2026-09-11-watch-together-discovery",
         "2026-09-06-plugin-model-api",
-        "2026-09-09-voice-session-activation-pngtuber",
         "2026-09-03-voice-identity-five-second-verification",
         "2026-09-08-voice-session-activation",
+        "2026-09-09-voice-session-activation-pngtuber",
+        "2026-09-13-plugin-html-content-main-merge",
+        "2026-09-13-plugin-html-content-proactive-community",
+        "2026-09-14-plugin-html-content-main-merge",
+        "2026-09-14-plugin-model-api-proactive-community",
+        "2026-09-22-plugin-html-content-main-merge",
+        "2026-09-22-voice-session-activation",
     }
 )
 
@@ -169,7 +176,7 @@ RETIRED_LOCALE_VERSIONS = frozenset(
 #
 # 数组也按下标展开，所以往 badminton.lines.* 这类台词数组里追加一条同样会打红：
 # 陈旧缓存下那一条会取到 undefined，症状和缺 key 是一类。
-LOCALE_KEY_SIGNATURE = "d6d2d11b87568b90e35fec096045859b660991d99d023cfd98351a4aff9bb113"
+LOCALE_KEY_SIGNATURE = "9d41ffa07c2bcfc0e5a6bf37f22de5b8eb540649f60573c73c84943d4365a4ee"
 
 _BUMP_INSTRUCTIONS = (
     "static/locales 的 key 结构变了。请在 static/i18n-i18next.js 里把 LOCALE_VERSION "
