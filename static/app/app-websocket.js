@@ -4779,6 +4779,9 @@
                             // A Linux source enumeration may reopen the desktop
                             // portal every step. A broker reads the already-owned
                             // stream in Chat without enumerating sources.
+                            // Only the explicit flag counts here: every bridge with
+                            // captureComputerUseScreen declares it, and inferring
+                            // from the UA would refuse a working one-shot capture.
                             if (dc.sourceEnumerationMayPrompt === true
                                 && !(dc.computerUseSharedStreamBroker === true
                                     && dc.computerUseNeedsStream === true)) {

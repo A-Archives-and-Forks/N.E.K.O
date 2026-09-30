@@ -7,6 +7,8 @@ from playwright.sync_api import Page
 
 ROOT = Path(__file__).resolve().parents[2]
 APP_AUDIO_CAPTURE = ROOT / "static" / "app" / "app-audio-capture.js"
+APP_SCREEN = ROOT / "static" / "app" / "app-screen.js"
+DESKTOP_CAPTURE_PROVIDER = ROOT / "static" / "app" / "desktop-capture-provider.js"
 VOICE_POPOVER_LOCAL_LISTENERS = (
     "document:pointerdown",
     "document:keydown",
@@ -355,6 +357,7 @@ def _install_voice_popover_harness(
     )
     harness = harness.replace("__PERMISSION_SOURCE__", permission_source)
     harness = harness.replace("__RENDER_EXPRESSION__", render_expression)
+    page.add_script_tag(path=str(DESKTOP_CAPTURE_PROVIDER))
     page.add_script_tag(content=harness)
 
 
@@ -703,7 +706,7 @@ def test_voice_device_and_screen_actions_share_one_owned_subwindow(
 
 
 @pytest.mark.frontend
-@pytest.mark.parametrize("capability", [False, True, "unknown", "browser"])
+@pytest.mark.parametrize("capability", [False, True, "browser"])
 def test_screen_source_hover_defers_prompting_enumeration(
     page: Page, capability: bool | str,
 ) -> None:
@@ -717,15 +720,12 @@ def test_screen_source_hover_defers_prompting_enumeration(
     page.evaluate(
         """(capability) => {
             window.getDesktopCaptureProvider = () => capability === 'browser'
-                ? null : {
-                    getSources() {},
-                    sourceEnumerationMayPrompt: capability === 'unknown'
-                        ? undefined : capability,
-                };
+                ? null : { getSources() {}, sourceEnumerationMayPrompt: capability };
         }""",
         capability,
     )
-    prompting = capability is True or capability == "unknown"
+    # Unflagged providers are covered per platform by the tests below.
+    prompting = capability is True
     action = page.locator('[data-neko-mic-main-action="screen"]')
     action.hover()
     page.wait_for_function("window.__screenRenderOptions.length === 1")
@@ -747,6 +747,146 @@ def test_screen_source_hover_defers_prompting_enumeration(
     assert page.evaluate("window.__screenRenderOptions") == expected
     assert page.locator(".screen-source-title-filter").count() == 1
     assert page.evaluate("window.__voicePopoverTest.panels()") == 1
+    assert page.evaluate("window.__screenToggleCalls") == 0
+
+
+@pytest.mark.frontend
+@pytest.mark.parametrize(
+    ("capability", "platform", "prompting"),
+    [
+        # Legacy bridges without the flag: only Linux may show a portal.
+        (None, "Macintosh; Intel Mac OS X 14_0", False),
+        (None, "Windows NT 10.0; Win64; x64", False),
+        (None, "X11; Linux x86_64", True),
+        (None, "Linux; Android 14; Pixel 8", False),
+        # An explicit flag always wins over the platform guess.
+        (True, "Macintosh; Intel Mac OS X 14_0", True),
+        (False, "X11; Linux x86_64", False),
+    ],
+)
+def test_screen_source_hover_infers_legacy_provider_prompting(
+    page: Page, capability: bool | None, platform: str, prompting: bool,
+) -> None:
+    _install_voice_popover_harness(page, deferred_permission=False)
+    page.evaluate(
+        """([capability, platform]) => {
+            Object.defineProperty(navigator, 'userAgent', {
+                configurable: true,
+                value: 'Mozilla/5.0 (' + platform + ') AppleWebKit/537.36 Chrome/130 Safari/537.36',
+            });
+            window.getDesktopCaptureProvider = () => {
+                const provider = { getSources() {} };
+                if (capability !== null) {
+                    provider.sourceEnumerationMayPrompt = capability;
+                }
+                return provider;
+            };
+        }""",
+        [capability, platform],
+    )
+    page.evaluate(
+        """async () => {
+            await window.renderFloatingMicList(window.__voicePopoverTest.popup());
+        }"""
+    )
+    page.locator('[data-neko-mic-main-action="screen"]').hover()
+    page.wait_for_function("window.__screenRenderOptions.length === 1")
+    assert page.evaluate("window.__screenRenderOptions") == [
+        {"deferEnumeration": prompting}
+    ]
+    load = page.locator("[data-neko-screen-source-deferred-load]")
+    assert load.count() == (1 if prompting else 0)
+    assert page.locator(".screen-source-title-filter").count() == (
+        0 if prompting else 1
+    )
+    assert page.evaluate("window.__screenToggleCalls") == 0
+
+
+@pytest.mark.frontend
+@pytest.mark.parametrize(
+    ("platform", "prompting"),
+    [
+        ("Macintosh; Intel Mac OS X 14_0", False),
+        ("Windows NT 10.0; Win64; x64", False),
+        ("X11; Linux x86_64", True),
+    ],
+)
+def test_legacy_provider_hover_runs_real_source_enumeration(
+    page: Page, platform: str, prompting: bool,
+) -> None:
+    """Hover drives the real app-screen.js list against an unflagged bridge."""
+    _install_voice_popover_harness(page, deferred_permission=False)
+    page.evaluate(
+        """(platform) => {
+            Object.defineProperty(navigator, 'userAgent', {
+                configurable: true,
+                value: 'Mozilla/5.0 (' + platform + ') AppleWebKit/537.36 Chrome/130 Safari/537.36',
+            });
+            const storedValues = new Map();
+            Object.defineProperty(window, 'localStorage', {
+                configurable: true,
+                value: {
+                    getItem: (key) => (storedValues.has(key) ? storedValues.get(key) : null),
+                    setItem: (key, value) => { storedValues.set(key, String(value)); },
+                    removeItem: (key) => { storedValues.delete(key); },
+                },
+            });
+            window.appUtils.isMobile = () => false;
+            window.appConst.SCREEN_SOURCE_THUMBNAIL_TIMEOUT = 15000;
+            window.safeT = (_key, fallback) => fallback;
+            window.__getSourcesCalls = [];
+            const emptyThumbnail = { isEmpty: () => true, toDataURL: () => '' };
+            // A bridge from before sourceEnumerationMayPrompt existed.
+            window.electronDesktopCapturer = {
+                getSources(options) {
+                    window.__getSourcesCalls.push(options);
+                    return Promise.resolve([
+                        { id: 'screen:1', name: 'Entire Screen', display_id: '1', thumbnail: emptyThumbnail },
+                        { id: 'window:2', name: 'Editor', display_id: '', thumbnail: emptyThumbnail },
+                    ]);
+                },
+            };
+        }""",
+        platform,
+    )
+    page.add_script_tag(path=str(DESKTOP_CAPTURE_PROVIDER))
+    page.add_script_tag(path=str(APP_SCREEN))
+    page.evaluate(
+        """async () => {
+            await window.renderFloatingMicList(window.__voicePopoverTest.popup());
+        }"""
+    )
+
+    page.locator('[data-neko-mic-main-action="screen"]').hover()
+    panel = page.locator(
+        '.neko-mic-subwindow[data-neko-mic-action-key="screen"]'
+    )
+    load = panel.locator("[data-neko-screen-source-deferred-load]")
+    options = panel.locator(".screen-source-option")
+    if prompting:
+        load.wait_for()
+        assert page.evaluate("window.__getSourcesCalls.length") == 0
+        assert options.count() == 0
+        load.click()
+
+    options.first.wait_for()
+    assert options.count() == 2
+    if prompting:
+        # A second getSources would reopen the portal on Wayland; the
+        # thumbnail phase must reuse the first enumeration.
+        page.wait_for_timeout(200)
+        assert page.evaluate("window.__getSourcesCalls.length") == 1
+    else:
+        # Names first, then one cached thumbnail batch.
+        page.wait_for_function("window.__getSourcesCalls.length === 2")
+        page.wait_for_timeout(200)
+        assert page.evaluate("window.__getSourcesCalls.length") == 2
+        assert page.evaluate(
+            "window.__getSourcesCalls[1].thumbnailCache"
+        ) is True
+    # Prompting providers keep a "choose again" button above the list;
+    # macOS / Windows list sources with no extra button at all.
+    assert load.count() == (1 if prompting else 0)
     assert page.evaluate("window.__screenToggleCalls") == 0
 
 
